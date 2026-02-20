@@ -5,15 +5,14 @@ Provides endpoints so anyone (Slack bot, web UI, curl) can trigger
 an agent task and poll for results, without needing a local terminal.
 
 Features:
-    - API Key authentication (X-API-Key header or api_key query param)
     - WebSocket real-time updates (/ws/{job_id})
     - SQLite-backed persistent job storage
+    - Automatic retry with exponential backoff
 
 Usage:
     # One-time: store secrets in Modal
     modal secret create gemini-key GEMINI_API_KEY=AIza...
     modal secret create github-token GITHUB_TOKEN=ghp_...
-    modal secret create api-auth API_KEY=your-secret-key
 
     # Deploy (creates permanent public URLs)
     modal deploy api.py
@@ -23,9 +22,9 @@ Usage:
 """
 
 import asyncio
-import json
 import modal
 import os
+import shutil
 import time
 import uuid
 
@@ -33,10 +32,15 @@ from shared import sandbox_image, setup_github_auth, clone_and_install, run_agen
 from models import (
     db_volume, DB_DIR,
     create_job, get_job, update_job, list_jobs, now_iso,
+    create_pipeline, get_pipeline, list_pipelines, delete_pipeline,
+    create_pipeline_run, get_pipeline_run, update_pipeline_run,
+    list_pipeline_runs, get_jobs_for_run,
 )
+from scheduler import topological_sort, resolve_templates
 
 MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY = 10  # seconds, exponential: 10, 20, 40
+WORKSPACE = "/app/workspace"
 
 # ---------------------------------------------------------------------------
 # 1. Modal App
@@ -64,24 +68,34 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
     Supports automatic retry with exponential backoff (up to MAX_ATTEMPTS).
     """
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
+    all_logs = []
 
     update_job(job_id, status="running", started_at=now_iso())
 
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            update_job(
-                job_id,
-                attempt=attempt,
-                logs=[f"[Attempt {attempt}/{MAX_ATTEMPTS}] Authenticating with GitHub..."],
-            )
+            # Clean up workspace from previous attempt
+            if os.path.exists(WORKSPACE):
+                shutil.rmtree(WORKSPACE)
+
+            msg = f"[Attempt {attempt}/{MAX_ATTEMPTS}] Authenticating with GitHub..."
+            all_logs.append(msg)
+            update_job(job_id, attempt=attempt, logs=all_logs)
             setup_github_auth(token)
 
-            update_job(job_id, logs=[f"[Attempt {attempt}/{MAX_ATTEMPTS}] Cloning repository..."])
+            msg = f"[Attempt {attempt}/{MAX_ATTEMPTS}] Cloning repository..."
+            all_logs.append(msg)
+            update_job(job_id, logs=all_logs)
             clone_and_install(repo_url)
 
-            update_job(job_id, logs=[f"[Attempt {attempt}/{MAX_ATTEMPTS}] Agent engine starting..."])
+            msg = f"[Attempt {attempt}/{MAX_ATTEMPTS}] Agent engine starting..."
+            all_logs.append(msg)
+            update_job(job_id, logs=all_logs)
             result = run_agent(task)
+
+            # Merge agent log lines into accumulated logs
+            all_logs.extend(result["log_lines"])
 
             update_job(
                 job_id,
@@ -97,7 +111,7 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
                     ),
                     "exit_code": result["exit_code"],
                 },
-                logs=result["log_lines"],
+                logs=all_logs,
             )
 
             db_volume.commit()
@@ -109,33 +123,274 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
 
             if attempt < MAX_ATTEMPTS:
                 delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                msg = f"[Attempt {attempt}/{MAX_ATTEMPTS}] Failed: {error_msg}. Retrying in {delay}s..."
+                all_logs.append(msg)
                 update_job(
                     job_id,
                     status="retrying",
                     attempt=attempt,
-                    error=f"Attempt {attempt} failed: {error_msg}. Retrying in {delay}s...",
+                    error=error_msg,
+                    logs=all_logs,
                 )
                 db_volume.commit()
                 time.sleep(delay)
             else:
+                msg = f"[Attempt {attempt}/{MAX_ATTEMPTS}] Failed: {error_msg}"
+                all_logs.append(msg)
                 update_job(
                     job_id,
                     status="failed",
                     completed_at=now_iso(),
                     attempt=attempt,
                     error=f"All {MAX_ATTEMPTS} attempts failed. Last error: {error_msg}",
+                    logs=all_logs,
                 )
                 db_volume.commit()
                 raise last_error
 
 
 # ---------------------------------------------------------------------------
-# 3. HTTP API — FastAPI app with CORS, Auth, and WebSocket
+# 2b. Pipeline step executor — runs a single step with context
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=sandbox_image,
+    timeout=1800,
+    volumes={DB_DIR: db_volume},
+    secrets=[
+        modal.Secret.from_name("gemini-key", required_keys=["GEMINI_API_KEY"]),
+        modal.Secret.from_name("github-token", required_keys=["GITHUB_TOKEN"]),
+    ],
+)
+def run_pipeline_step(
+    job_id: str,
+    repo_url: str,
+    task: str,
+    step_context: dict,
+    github_token: str = "",
+):
+    """
+    Execute a single pipeline step. Similar to run_agent_task but passes
+    step_context to the agent for upstream output awareness.
+    """
+    token = github_token or os.environ.get("GITHUB_TOKEN", "")
+    all_logs = []
+
+    update_job(job_id, status="running", started_at=now_iso())
+
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            if os.path.exists(WORKSPACE):
+                shutil.rmtree(WORKSPACE)
+
+            msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Authenticating..."
+            all_logs.append(msg)
+            update_job(job_id, attempt=attempt, logs=all_logs)
+            setup_github_auth(token)
+
+            msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Cloning..."
+            all_logs.append(msg)
+            update_job(job_id, logs=all_logs)
+            clone_and_install(repo_url)
+
+            msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Agent starting..."
+            all_logs.append(msg)
+            update_job(job_id, logs=all_logs)
+            result = run_agent(task, step_context=step_context)
+
+            all_logs.extend(result["log_lines"])
+
+            update_job(
+                job_id,
+                status="completed",
+                completed_at=now_iso(),
+                attempt=attempt,
+                result={
+                    "pr_url": result["pr_url"],
+                    "summary": (
+                        f"Step completed. PR: {result['pr_url']}"
+                        if result["pr_url"]
+                        else "Step completed (no PR)."
+                    ),
+                    "exit_code": result["exit_code"],
+                },
+                step_output=result["step_output"],
+                logs=all_logs,
+            )
+
+            db_volume.commit()
+            return result["step_output"]
+
+        except Exception as exc:
+            last_error = exc
+            error_msg = str(exc)[:500]
+
+            if attempt < MAX_ATTEMPTS:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}] Failed: {error_msg}. Retrying in {delay}s..."
+                all_logs.append(msg)
+                update_job(
+                    job_id, status="retrying", attempt=attempt,
+                    error=error_msg, logs=all_logs,
+                )
+                db_volume.commit()
+                time.sleep(delay)
+            else:
+                msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}] Failed: {error_msg}"
+                all_logs.append(msg)
+                update_job(
+                    job_id, status="failed", completed_at=now_iso(),
+                    attempt=attempt,
+                    error=f"All {MAX_ATTEMPTS} attempts failed. Last: {error_msg}",
+                    logs=all_logs,
+                )
+                db_volume.commit()
+                raise last_error
+
+
+# ---------------------------------------------------------------------------
+# 2c. Pipeline orchestrator — executes all steps according to DAG order
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=modal.Image.debian_slim().pip_install("fastapi[standard]"),
+    timeout=7200,  # pipelines can take longer
+    volumes={DB_DIR: db_volume},
+)
+def run_pipeline_task(
+    run_id: str,
+    pipeline_id: str,
+    repo_url: str,
+    steps: list,
+    github_token: str = "",
+):
+    """
+    Orchestrate a full pipeline run: execute steps in DAG order,
+    passing upstream outputs to downstream steps.
+    """
+    try:
+        _execute_pipeline_steps(run_id, pipeline_id, repo_url, steps, github_token)
+    except Exception as exc:
+        # Catch-all: ensure the run never gets stuck in "running"
+        update_pipeline_run(
+            run_id,
+            status="failed",
+            completed_at=now_iso(),
+            error=f"Pipeline crashed: {str(exc)[:500]}",
+        )
+        db_volume.commit()
+        raise
+
+
+def _execute_pipeline_steps(
+    run_id: str,
+    pipeline_id: str,
+    repo_url: str,
+    steps: list,
+    github_token: str,
+):
+    """Inner pipeline execution logic, wrapped by run_pipeline_task for safety."""
+    update_pipeline_run(run_id, status="running", started_at=now_iso())
+
+    step_map = {s["name"]: s for s in steps}
+    layers = topological_sort(steps)
+
+    # Create job records for each step
+    job_ids: dict[str, str] = {}
+    for idx, step in enumerate(steps):
+        job_id = str(uuid.uuid4())
+        create_job(
+            job_id=job_id,
+            repo_url=repo_url,
+            task=step["task"],
+            pipeline_id=pipeline_id,
+            run_id=run_id,
+            step_name=step["name"],
+            step_index=idx,
+        )
+        job_ids[step["name"]] = job_id
+
+    db_volume.commit()
+
+    # Execute layer by layer
+    step_outputs: dict[str, dict] = {}
+    failed = False
+
+    for layer in layers:
+        if failed:
+            # Skip remaining layers
+            for step_name in layer:
+                jid = job_ids.get(step_name)
+                if jid:
+                    update_job(
+                        jid, status="failed",
+                        error="Skipped: upstream step failed",
+                        completed_at=now_iso(),
+                    )
+            db_volume.commit()
+            continue
+
+        for step_name in layer:
+            step_def = step_map[step_name]
+            jid = job_ids[step_name]
+
+            # Resolve template variables
+            resolved_task = resolve_templates(step_def["task"], step_outputs)
+
+            step_context = {
+                "pipeline_id": pipeline_id,
+                "run_id": run_id,
+                "step_name": step_name,
+                "upstream_outputs": step_outputs,
+            }
+
+            on_failure = step_def.get("on_failure", "stop")
+
+            try:
+                # Run the step synchronously (it's already in a Modal function)
+                step_result = run_pipeline_step.remote(
+                    jid, repo_url, resolved_task, step_context, github_token,
+                )
+
+                # Reload volume to see the step's DB writes
+                db_volume.reload()
+
+                if step_result:
+                    step_outputs[step_name] = step_result
+                else:
+                    step_outputs[step_name] = {"exit_code": 0}
+
+                # Verify the job didn't fail
+                updated_job = get_job(jid)
+                if updated_job and updated_job.get("status") == "failed":
+                    raise RuntimeError(updated_job.get("error", "Step failed"))
+
+            except Exception as exc:
+                step_outputs[step_name] = {"error": str(exc)[:500]}
+
+                if on_failure == "stop":
+                    failed = True
+                    update_pipeline_run(
+                        run_id,
+                        error=f"Step '{step_name}' failed: {str(exc)[:500]}",
+                    )
+                    db_volume.commit()
+                    break
+
+    # Finalize the run
+    final_status = "failed" if failed else "completed"
+    update_pipeline_run(run_id, status=final_status, completed_at=now_iso())
+    db_volume.commit()
+
+
+# ---------------------------------------------------------------------------
+# 3. HTTP API — FastAPI app with CORS and WebSocket
 # ---------------------------------------------------------------------------
 
 api_image = modal.Image.debian_slim().pip_install("fastapi[standard]")
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
@@ -151,39 +406,7 @@ web_app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# 3a. API Key Authentication
-# ---------------------------------------------------------------------------
-
-PUBLIC_PATHS = {"/health", "/ws"}
-
-
-async def verify_api_key(request: Request):
-    """Check API key from header or query param. Skip for public paths."""
-    # Allow WebSocket and health without auth
-    if request.url.path == "/health" or request.url.path.startswith("/ws/"):
-        return
-
-    expected_key = os.environ.get("API_KEY", "")
-    if not expected_key:
-        # No key configured — auth disabled (development mode)
-        return
-
-    provided_key = (
-        request.headers.get("X-API-Key")
-        or request.query_params.get("api_key")
-        or ""
-    )
-
-    if provided_key != expected_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-
-# Apply auth to all routes via dependency
-web_app.dependency_overrides = {}
-
-
-# ---------------------------------------------------------------------------
-# 3b. Endpoints
+# 3a. Endpoints
 # ---------------------------------------------------------------------------
 
 @web_app.get("/health")
@@ -191,7 +414,7 @@ def ep_health():
     return {"status": "ok", "timestamp": now_iso()}
 
 
-@web_app.post("/submit", dependencies=[Depends(verify_api_key)])
+@web_app.post("/submit")
 async def ep_submit(request: Request):
     body = await request.json()
 
@@ -219,7 +442,7 @@ async def ep_submit(request: Request):
     }
 
 
-@web_app.get("/status/{job_id}", dependencies=[Depends(verify_api_key)])
+@web_app.get("/status/{job_id}")
 def ep_status(job_id: str):
     record = get_job(job_id)
     if not record:
@@ -234,7 +457,7 @@ def ep_status(job_id: str):
     }
 
 
-@web_app.get("/result/{job_id}", dependencies=[Depends(verify_api_key)])
+@web_app.get("/result/{job_id}")
 def ep_result(job_id: str):
     record = get_job(job_id)
     if not record:
@@ -255,7 +478,7 @@ def ep_result(job_id: str):
     }
 
 
-@web_app.get("/jobs", dependencies=[Depends(verify_api_key)])
+@web_app.get("/jobs")
 def ep_jobs():
     """List all jobs, newest first. Returns summary (no logs)."""
     jobs = list_jobs()
@@ -273,6 +496,151 @@ def ep_jobs():
         }
         for j in jobs
     ]
+
+
+# ---------------------------------------------------------------------------
+# 3b. Pipeline endpoints
+# ---------------------------------------------------------------------------
+
+@web_app.post("/pipelines")
+async def ep_create_pipeline(request: Request):
+    """Create a new pipeline definition."""
+    body = await request.json()
+
+    name = body.get("name")
+    steps = body.get("steps")
+    if not name or not steps:
+        return JSONResponse(
+            {"error": "'name' and 'steps' are required."},
+            status_code=400,
+        )
+
+    # Validate each step
+    seen_names = set()
+    for i, step in enumerate(steps):
+        if "name" not in step or "task" not in step:
+            return JSONResponse(
+                {"error": f"Step {i} must have 'name' and 'task' fields."},
+                status_code=400,
+            )
+        if step["name"] in seen_names:
+            return JSONResponse(
+                {"error": f"Duplicate step name: '{step['name']}'"},
+                status_code=400,
+            )
+        seen_names.add(step["name"])
+
+    # Validate DAG (no cycles, valid depends_on references)
+    try:
+        topological_sort(steps)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    pipeline_id = str(uuid.uuid4())
+    repo_url = body.get("repo_url", "")
+
+    record = create_pipeline(pipeline_id, name, repo_url, steps)
+    return record
+
+
+@web_app.get("/pipelines")
+def ep_list_pipelines():
+    """List all pipeline definitions."""
+    return list_pipelines()
+
+
+@web_app.get("/pipelines/{pipeline_id}")
+def ep_get_pipeline(pipeline_id: str):
+    """Get a pipeline definition by ID."""
+    record = get_pipeline(pipeline_id)
+    if not record:
+        return JSONResponse(
+            {"error": f"Pipeline '{pipeline_id}' not found."}, status_code=404
+        )
+    return record
+
+
+@web_app.delete("/pipelines/{pipeline_id}")
+def ep_delete_pipeline(pipeline_id: str):
+    """Delete a pipeline definition."""
+    deleted = delete_pipeline(pipeline_id)
+    if not deleted:
+        return JSONResponse(
+            {"error": f"Pipeline '{pipeline_id}' not found."}, status_code=404
+        )
+    return {"deleted": True}
+
+
+@web_app.post("/pipelines/{pipeline_id}/run")
+async def ep_run_pipeline(pipeline_id: str, request: Request):
+    """Trigger a pipeline execution."""
+    pipeline = get_pipeline(pipeline_id)
+    if not pipeline:
+        return JSONResponse(
+            {"error": f"Pipeline '{pipeline_id}' not found."}, status_code=404
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    repo_url = body.get("repo_url") or pipeline.get("repo_url")
+    github_token = body.get("github_token", "")
+
+    if not repo_url:
+        return JSONResponse(
+            {"error": "No repo_url provided and pipeline has no default."},
+            status_code=400,
+        )
+
+    run_id = str(uuid.uuid4())
+    run = create_pipeline_run(run_id, pipeline_id, repo_url)
+
+    # Fire and forget — pipeline orchestrator runs in background
+    run_pipeline_task.spawn(
+        run_id, pipeline_id, repo_url, pipeline["steps"], github_token,
+    )
+
+    return {
+        "run_id": run_id,
+        "pipeline_id": pipeline_id,
+        "status": "pending",
+        "repo_url": repo_url,
+    }
+
+
+@web_app.get("/pipelines/{pipeline_id}/runs")
+def ep_list_pipeline_runs(pipeline_id: str):
+    """List all runs for a pipeline."""
+    return list_pipeline_runs(pipeline_id)
+
+
+@web_app.get("/runs/{run_id}")
+def ep_get_run(run_id: str):
+    """Get pipeline run details including all step jobs."""
+    run = get_pipeline_run(run_id)
+    if not run:
+        return JSONResponse(
+            {"error": f"Run '{run_id}' not found."}, status_code=404
+        )
+
+    jobs = get_jobs_for_run(run_id)
+    run["jobs"] = [
+        {
+            "job_id": j["job_id"],
+            "step_name": j.get("step_name"),
+            "step_index": j.get("step_index"),
+            "status": j["status"],
+            "task": j["task"][:100],
+            "started_at": j.get("started_at"),
+            "completed_at": j.get("completed_at"),
+            "error": j.get("error"),
+            "step_output": j.get("step_output"),
+            "pr_url": (j.get("result") or {}).get("pr_url"),
+        }
+        for j in jobs
+    ]
+    return run
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +676,6 @@ async def ws_job(websocket: WebSocket, job_id: str):
 
             # Send update if something changed
             if current_status != last_status or len(current_logs) != last_log_count:
-                # Only send new log lines
                 new_logs = current_logs[last_log_count:]
                 await websocket.send_json({
                     "type": "update",
@@ -342,11 +709,7 @@ async def ws_job(websocket: WebSocket, job_id: str):
 # Mount the FastAPI app onto a single Modal function
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=api_image,
-    volumes={DB_DIR: db_volume},
-    secrets=[modal.Secret.from_name("api-auth", required_keys=["API_KEY"])],
-)
+@app.function(image=api_image, volumes={DB_DIR: db_volume})
 @modal.asgi_app()
 def api():
     return web_app

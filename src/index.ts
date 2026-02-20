@@ -1,7 +1,6 @@
 import { createOpencode } from "@opencode-ai/sdk";
 import type { Event as SdkEvent } from "@opencode-ai/sdk";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import fs from "node:fs";
 
 // Re-alias the SDK's Event union so we can reference it concisely.
 type AgentEvent = SdkEvent;
@@ -11,12 +10,26 @@ type AgentEvent = SdkEvent;
 // ---------------------------------------------------------------------------
 
 const WORKSPACE = "/app/workspace";
+const STEP_RESULT_PATH = "/app/step_result.json";
 
 // Task description comes from the environment (set by sandbox.py).
 // Falls back to a safe default so local development still works.
 const TASK_DESCRIPTION =
   process.env.TASK_DESCRIPTION ||
   "Improve the README with a better project description and usage instructions.";
+
+// Step context from pipeline execution (set by shared.py's run_agent).
+// Contains upstream step outputs for template-resolved references.
+const STEP_CONTEXT: Record<string, unknown> | null = (() => {
+  const raw = process.env.STEP_CONTEXT;
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    console.warn("[ENGINE] Failed to parse STEP_CONTEXT:", raw.slice(0, 200));
+    return null;
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // System prompt — teaches the agent the full Git → PR workflow
@@ -55,8 +68,13 @@ Your job is to complete a task on a codebase and submit the result as a GitHub P
 - When you are done and the PR is created, output the PR URL as your final message.
 `;
 
+// If running as part of a pipeline, append upstream context to the prompt
+const STEP_CONTEXT_SECTION = STEP_CONTEXT
+  ? `\n## Pipeline Context\nYou are running as step "${(STEP_CONTEXT as Record<string, unknown>).step_name ?? "unknown"}" in a pipeline.\n\nUpstream step outputs are available below — use them if relevant to your task:\n\`\`\`json\n${JSON.stringify((STEP_CONTEXT as Record<string, unknown>).upstream_outputs ?? {}, null, 2)}\n\`\`\`\n`
+  : "";
+
 // Build the user-facing task prompt
-const TASK_PROMPT = `Here is your task:\n\n${TASK_DESCRIPTION}`;
+const TASK_PROMPT = `Here is your task:\n\n${TASK_DESCRIPTION}${STEP_CONTEXT_SECTION}`;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -374,16 +392,44 @@ async function main(): Promise<void> {
     path: { id: session.id },
   });
 
+  // Extract PR URL from the last assistant message
+  let prUrl: string | null = null;
   if (messages && Array.isArray(messages)) {
     console.log();
     log("ENGINE", `Total messages in session: ${messages.length}`);
     for (const msg of messages) {
       const role = (msg as Record<string, unknown>).role ?? "unknown";
-      log("HISTORY", `[${role}] ${JSON.stringify(msg).slice(0, 150)}`);
+      const msgStr = JSON.stringify(msg);
+      log("HISTORY", `[${role}] ${msgStr.slice(0, 150)}`);
+
+      // Look for PR URL in message content
+      const prMatch = msgStr.match(
+        /https:\/\/github\.com\/[^\s"']+\/pull\/\d+/
+      );
+      if (prMatch) {
+        prUrl = prMatch[0];
+      }
     }
   }
 
-  // 8. Give the event stream a moment to flush any remaining events, then
+  // 8. Write structured step result for pipeline coordination.
+  //    shared.py's run_agent() reads this file after execution.
+  const stepResult: Record<string, unknown> = {
+    pr_url: prUrl,
+    exit_code: 0,
+    step_name: STEP_CONTEXT
+      ? (STEP_CONTEXT as Record<string, unknown>).step_name
+      : null,
+  };
+
+  try {
+    fs.writeFileSync(STEP_RESULT_PATH, JSON.stringify(stepResult, null, 2));
+    log("ENGINE", `Step result written to ${STEP_RESULT_PATH}`);
+  } catch (err) {
+    log("ENGINE:WARN", `Failed to write step result: ${err}`);
+  }
+
+  // 9. Give the event stream a moment to flush any remaining events, then
   //    shut down the server gracefully.
   await new Promise((resolve) => setTimeout(resolve, 2_000));
 

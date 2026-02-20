@@ -7,19 +7,9 @@ const WS_BASE = API_BASE.replace(/^http/, "ws");
 const POLL_INTERVAL = 5000;
 
 // ── API helpers ──────────────────────────────────────────────────────────────
-function getApiKey() {
-  return localStorage.getItem("agent_api_key") || "";
-}
-
 async function api(path, options = {}) {
-  const apiKey = getApiKey();
   const headers = { "Content-Type": "application/json", ...options.headers };
-  if (apiKey) headers["X-API-Key"] = apiKey;
-
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
-  if (res.status === 401) {
-    throw new Error("AUTH_REQUIRED");
-  }
   return res.json();
 }
 
@@ -85,35 +75,26 @@ export default function App() {
   const [task, setTask] = useState("");
   const [ghToken, setGhToken] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [apiKey, setApiKey] = useState(getApiKey());
-  const [authError, setAuthError] = useState(false);
   const [wsLogs, setWsLogs] = useState([]);
 
   const wsRef = useRef(null);
-
-  // Save API key
-  const saveApiKey = (key) => {
-    setApiKey(key);
-    localStorage.setItem("agent_api_key", key);
-    setAuthError(false);
-  };
+  // Refs to hold latest function versions for WebSocket callbacks
+  const selectJobRef = useRef(null);
+  const fetchJobsRef = useRef(null);
 
   // Fetch all jobs
   const fetchJobs = useCallback(async () => {
     try {
       const data = await api("/jobs");
       setJobs(Array.isArray(data) ? data : []);
-      setAuthError(false);
     } catch (e) {
-      if (e.message === "AUTH_REQUIRED") {
-        setAuthError(true);
-      } else {
-        console.error("Failed to fetch jobs:", e);
-      }
+      console.error("Failed to fetch jobs:", e);
     } finally {
       setLoading(false);
     }
   }, []);
+
+  fetchJobsRef.current = fetchJobs;
 
   useEffect(() => {
     fetchJobs();
@@ -123,7 +104,6 @@ export default function App() {
 
   // WebSocket connection for selected job
   const connectWs = useCallback((jobId) => {
-    // Close existing connection
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -148,9 +128,8 @@ export default function App() {
           setWsLogs(prev => [...prev, ...data.new_logs]);
         }
       } else if (data.type === "done") {
-        // Refresh full job details on completion
-        selectJob(jobId);
-        fetchJobs();
+        selectJobRef.current?.(jobId);
+        fetchJobsRef.current?.();
       }
     };
 
@@ -182,16 +161,17 @@ export default function App() {
         connectWs(jobId);
       }
     } catch (e) {
-      if (e.message === "AUTH_REQUIRED") setAuthError(true);
-      else console.error(e);
+      console.error(e);
     }
   };
+
+  selectJobRef.current = selectJob;
 
   // Auto-refresh active job (fallback when WebSocket is not connected)
   useEffect(() => {
     if (!selected || selected.status === "completed" || selected.status === "failed") return;
     if (wsRef.current) return; // WebSocket is handling updates
-    const t = setInterval(() => selectJob(selected.job_id), POLL_INTERVAL);
+    const t = setInterval(() => selectJobRef.current?.(selected.job_id), POLL_INTERVAL);
     return () => clearInterval(t);
   }, [selected]);
 
@@ -208,8 +188,7 @@ export default function App() {
       await fetchJobs();
       if (data.job_id) selectJob(data.job_id);
     } catch (e) {
-      if (e.message === "AUTH_REQUIRED") setAuthError(true);
-      else console.error(e);
+      console.error(e);
     } finally {
       setSubmitting(false);
     }
@@ -227,26 +206,6 @@ export default function App() {
           <p style={{ margin: "4px 0 0", fontSize: 13, color: "#64748b" }}>
             Background Coding Agent · {jobs.length} job{jobs.length !== 1 ? "s" : ""}
           </p>
-        </div>
-
-        {/* API Key input */}
-        <div style={{ padding: "12px 16px", borderBottom: "1px solid #e2e8f0", background: authError ? "#fef2f2" : "#f8fafc" }}>
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
-              type="password"
-              placeholder="API Key"
-              value={apiKey}
-              onChange={e => saveApiKey(e.target.value)}
-              style={{ ...inputStyle, flex: 1, fontSize: 12 }}
-            />
-            <div style={{
-              fontSize: 11, display: "flex", alignItems: "center",
-              color: authError ? "#991b1b" : apiKey ? "#065f46" : "#94a3b8",
-              whiteSpace: "nowrap",
-            }}>
-              {authError ? "Invalid key" : apiKey ? "Connected" : "No key"}
-            </div>
-          </div>
         </div>
 
         <form onSubmit={handleSubmit} style={{
