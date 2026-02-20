@@ -2,8 +2,7 @@
 Data models and database access layer.
 
 Uses SQLite stored on a Modal Volume for persistence across deployments.
-Schema is designed to support the current job system and future
-pipeline/batch/schedule features (Phase 2-3).
+Supports jobs, pipelines, pipeline runs, and scheduled tasks.
 """
 
 import json
@@ -30,43 +29,62 @@ DB_PATH = os.path.join(DB_DIR, "agent.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id         TEXT PRIMARY KEY,
-    pipeline_id    TEXT,
-    batch_id       TEXT,
-    step_index     INTEGER,
-    status         TEXT NOT NULL DEFAULT 'queued',
-    repo_url       TEXT NOT NULL,
-    task           TEXT NOT NULL,
-    submitted_by   TEXT DEFAULT '',
-    submitted_at   TEXT NOT NULL,
-    started_at     TEXT,
-    completed_at   TEXT,
-    result_json    TEXT,
-    error          TEXT,
-    logs_json      TEXT DEFAULT '[]',
-    attempt        INTEGER DEFAULT 1,
-    max_attempts   INTEGER DEFAULT 3,
-    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    job_id           TEXT PRIMARY KEY,
+    pipeline_id      TEXT,
+    run_id           TEXT,
+    batch_id         TEXT,
+    step_name        TEXT,
+    step_index       INTEGER,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    repo_url         TEXT NOT NULL,
+    task             TEXT NOT NULL,
+    submitted_by     TEXT DEFAULT '',
+    submitted_at     TEXT NOT NULL,
+    started_at       TEXT,
+    completed_at     TEXT,
+    result_json      TEXT,
+    step_output_json TEXT,
+    error            TEXT,
+    logs_json        TEXT DEFAULT '[]',
+    attempt          INTEGER DEFAULT 1,
+    max_attempts     INTEGER DEFAULT 3,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitted_at ON jobs(submitted_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_pipeline_id ON jobs(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_run_id ON jobs(run_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_batch_id ON jobs(batch_id);
 
--- Future Phase 2: Pipeline definitions
+-- Pipeline definitions (reusable templates)
 CREATE TABLE IF NOT EXISTS pipelines (
     pipeline_id    TEXT PRIMARY KEY,
     name           TEXT NOT NULL,
     repo_url       TEXT,
     steps_json     TEXT NOT NULL DEFAULT '[]',
-    status         TEXT NOT NULL DEFAULT 'draft',
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
--- Future Phase 3: Scheduled tasks
+-- Pipeline execution runs (one pipeline can be run many times)
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id         TEXT PRIMARY KEY,
+    pipeline_id    TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    repo_url       TEXT,
+    started_at     TEXT,
+    completed_at   TEXT,
+    error          TEXT,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_id ON pipeline_runs(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status);
+
+-- Scheduled tasks (Phase 3)
 CREATE TABLE IF NOT EXISTS schedules (
     schedule_id    TEXT PRIMARY KEY,
     name           TEXT NOT NULL,
@@ -124,14 +142,10 @@ def now_iso() -> str:
 def _row_to_dict(row: sqlite3.Row) -> dict:
     """Convert a sqlite3.Row to a plain dict, deserialising JSON fields."""
     d = dict(row)
-    if "result_json" in d:
-        d["result"] = json.loads(d.pop("result_json")) if d["result_json"] else None
-    if "logs_json" in d:
-        d["logs"] = json.loads(d.pop("logs_json")) if d["logs_json"] else []
-    if "steps_json" in d:
-        d["steps"] = json.loads(d.pop("steps_json")) if d["steps_json"] else []
-    if "repos_json" in d:
-        d["repos"] = json.loads(d.pop("repos_json")) if d["repos_json"] else []
+    for key in ("result_json", "logs_json", "steps_json", "repos_json", "step_output_json"):
+        if key in d:
+            clean_key = key.replace("_json", "") if key != "step_output_json" else "step_output"
+            d[clean_key] = json.loads(d.pop(key)) if d[key] else ([] if "logs" in key or "steps" in key or "repos" in key else None)
     return d
 
 
@@ -145,7 +159,9 @@ def create_job(
     task: str,
     user_id: str = "",
     pipeline_id: Optional[str] = None,
+    run_id: Optional[str] = None,
     batch_id: Optional[str] = None,
+    step_name: Optional[str] = None,
     step_index: Optional[int] = None,
 ) -> dict:
     """Insert a new job record and return it as a dict."""
@@ -154,10 +170,10 @@ def create_job(
         conn.execute(
             """INSERT INTO jobs
                (job_id, repo_url, task, submitted_by, submitted_at,
-                pipeline_id, batch_id, step_index, logs_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]')""",
+                pipeline_id, run_id, batch_id, step_name, step_index, logs_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')""",
             (job_id, repo_url, task, user_id, ts,
-             pipeline_id, batch_id, step_index),
+             pipeline_id, run_id, batch_id, step_name, step_index),
         )
     return get_job(job_id)
 
@@ -173,11 +189,12 @@ def get_job(job_id: str) -> Optional[dict]:
 
 def update_job(job_id: str, **fields) -> Optional[dict]:
     """Update specific fields on a job record."""
-    # Serialise complex fields
     if "result" in fields:
         fields["result_json"] = json.dumps(fields.pop("result"))
     if "logs" in fields:
         fields["logs_json"] = json.dumps(fields.pop("logs"))
+    if "step_output" in fields:
+        fields["step_output_json"] = json.dumps(fields.pop("step_output"))
 
     fields["updated_at"] = now_iso()
 
@@ -202,6 +219,16 @@ def list_jobs(limit: int = 100, offset: int = 0) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def get_jobs_for_run(run_id: str) -> list[dict]:
+    """Return all jobs belonging to a pipeline run, ordered by step_index."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE run_id = ? ORDER BY step_index",
+            (run_id,),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
 def cleanup_old_jobs(days: int = 30) -> int:
     """Delete completed/failed jobs older than `days`. Returns count deleted."""
     with get_db() as conn:
@@ -212,3 +239,97 @@ def cleanup_old_jobs(days: int = 30) -> int:
             (f"-{days} days",),
         )
     return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Pipeline CRUD
+# ---------------------------------------------------------------------------
+
+def create_pipeline(pipeline_id: str, name: str, repo_url: str, steps: list) -> dict:
+    """Create a new pipeline definition."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO pipelines (pipeline_id, name, repo_url, steps_json)
+               VALUES (?, ?, ?, ?)""",
+            (pipeline_id, name, repo_url, json.dumps(steps)),
+        )
+    return get_pipeline(pipeline_id)
+
+
+def get_pipeline(pipeline_id: str) -> Optional[dict]:
+    """Fetch a pipeline definition by ID."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM pipelines WHERE pipeline_id = ?", (pipeline_id,)
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def list_pipelines() -> list[dict]:
+    """Return all pipeline definitions."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pipelines ORDER BY created_at DESC"
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def delete_pipeline(pipeline_id: str) -> bool:
+    """Delete a pipeline definition. Returns True if deleted."""
+    with get_db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM pipelines WHERE pipeline_id = ?", (pipeline_id,)
+        )
+    return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Run CRUD
+# ---------------------------------------------------------------------------
+
+def create_pipeline_run(run_id: str, pipeline_id: str, repo_url: str) -> dict:
+    """Create a new pipeline run record."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO pipeline_runs (run_id, pipeline_id, repo_url)
+               VALUES (?, ?, ?)""",
+            (run_id, pipeline_id, repo_url),
+        )
+    return get_pipeline_run(run_id)
+
+
+def get_pipeline_run(run_id: str) -> Optional[dict]:
+    """Fetch a pipeline run by ID."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM pipeline_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def update_pipeline_run(run_id: str, **fields) -> Optional[dict]:
+    """Update a pipeline run record."""
+    fields["updated_at"] = now_iso()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [run_id]
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE pipeline_runs SET {set_clause} WHERE run_id = ?",
+            values,
+        )
+    return get_pipeline_run(run_id)
+
+
+def list_pipeline_runs(pipeline_id: Optional[str] = None) -> list[dict]:
+    """Return pipeline runs, optionally filtered by pipeline_id."""
+    with get_db() as conn:
+        if pipeline_id:
+            rows = conn.execute(
+                "SELECT * FROM pipeline_runs WHERE pipeline_id = ? ORDER BY created_at DESC",
+                (pipeline_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM pipeline_runs ORDER BY created_at DESC"
+            ).fetchall()
+    return [_row_to_dict(r) for r in rows]

@@ -40,7 +40,6 @@ GitHub Pull Request
 ```bash
 modal secret create gemini-key GEMINI_API_KEY=your_gemini_key
 modal secret create github-token GITHUB_TOKEN=your_github_token
-modal secret create api-auth API_KEY=your_api_key
 ```
 
 ### 2. Deploy the API
@@ -56,7 +55,6 @@ This gives you a permanent public URL like `https://your-name--agent-api-api.mod
 ```bash
 curl -X POST https://your-name--agent-api-api.modal.run/submit \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your_api_key" \
   -d '{
     "repo_url": "https://github.com/you/your-repo.git",
     "task": "Add unit tests for the utils module"
@@ -96,6 +94,8 @@ Open `http://localhost:5173` — you can submit tasks, watch status updates, vie
 
 ## API Endpoints
 
+### Jobs
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/submit` | Submit a new agent task |
@@ -105,7 +105,17 @@ Open `http://localhost:5173` — you can submit tasks, watch status updates, vie
 | `GET` | `/health` | Health check |
 | `WS` | `/ws/{job_id}` | WebSocket real-time job updates |
 
-All endpoints except `/health` and `/ws` require authentication via `X-API-Key` header or `api_key` query parameter. If no `API_KEY` secret is configured, auth is disabled (development mode).
+### Pipelines
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/pipelines` | Create a pipeline definition |
+| `GET` | `/pipelines` | List all pipelines |
+| `GET` | `/pipelines/{id}` | Get pipeline details |
+| `DELETE` | `/pipelines/{id}` | Delete a pipeline |
+| `POST` | `/pipelines/{id}/run` | Trigger a pipeline execution |
+| `GET` | `/pipelines/{id}/runs` | List runs for a pipeline |
+| `GET` | `/runs/{run_id}` | Get run details with step jobs |
 
 ### POST /submit
 
@@ -118,16 +128,33 @@ All endpoints except `/health` and `/ws` require authentication via `X-API-Key` 
 }
 ```
 
+### POST /pipelines
+
+```json
+{
+  "name": "Full CI Pipeline",
+  "repo_url": "https://github.com/owner/repo.git",
+  "steps": [
+    { "name": "lint",  "task": "Run eslint and fix all errors" },
+    { "name": "test",  "task": "Run all unit tests", "depends_on": ["lint"] },
+    { "name": "pr",    "task": "Create a PR with all changes", "depends_on": ["test"] }
+  ]
+}
+```
+
+Steps support `depends_on` for DAG ordering, `on_failure: "stop" | "continue"` for error handling, and `{{steps.<name>.output.<key>}}` template variables for referencing upstream outputs.
+
 ## Project Structure
 
 ```
 running_agent/
-├── api.py              # HTTP API + async job management + WebSocket
+├── api.py              # HTTP API + pipeline endpoints + WebSocket
 ├── sandbox.py          # CLI-triggered cloud execution
 ├── shared.py           # Shared infrastructure (image, auth, agent runner)
-├── models.py           # SQLite data models + database access layer
+├── models.py           # SQLite data models (jobs, pipelines, runs)
+├── scheduler.py        # DAG scheduler + template resolution
 ├── src/
-│   └── index.ts        # Agent engine — OpenCode SDK + Git PR workflow
+│   └── index.ts        # Agent engine — OpenCode SDK + step context + structured output
 ├── opencode.json       # LLM provider config (Gemini)
 ├── dashboard/          # React web UI
 │   └── src/App.jsx     # Dashboard app with WebSocket support
@@ -142,9 +169,11 @@ running_agent/
 
 **Phase 3 — Git PR Loop:** The agent creates branches, commits, pushes, and opens PRs autonomously via a structured system prompt.
 
-**Phase 4 — HTTP API:** Modal web endpoints expose an async job queue with API key authentication, WebSocket real-time updates, error retry (3 attempts with exponential backoff), and SQLite-backed persistent storage.
+**Phase 4 — HTTP API:** Modal web endpoints expose an async job queue with WebSocket real-time updates, error retry (3 attempts with exponential backoff), and SQLite-backed persistent storage.
 
-**Phase 5 — Dashboard:** React frontend for visual task management with WebSocket live updates and API key support.
+**Phase 5 — Dashboard:** React frontend for visual task management with WebSocket live updates.
+
+**Phase 6 — Workflow Engine:** Multi-step pipelines with DAG scheduling, step-to-step context passing, template variables, and failure handling.
 
 ## Tech Stack
 
