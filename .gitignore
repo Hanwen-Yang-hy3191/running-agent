@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+dummy-workspace/*
+!dummy-workspace/.gitkeep
+PLAN.md
+.claude/
