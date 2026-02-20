@@ -2,7 +2,7 @@
 
 An autonomous background coding agent that takes a GitHub repo and a task description, writes code in a cloud sandbox, and opens a Pull Request — all without human intervention.
 
-Inspired by the [Ramp background agent architecture](https://engineering.ramp.com/background-agent).
+Inspired by the [Ramp background agent architecture](https://builders.ramp.com/post/why-we-built-our-background-agent).
 
 ## How It Works
 
