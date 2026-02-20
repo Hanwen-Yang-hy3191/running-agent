@@ -1,13 +1,19 @@
 """
-Phase 4 — HTTP API for the Background Coding Agent.
+HTTP API for the Background Coding Agent.
 
-Provides webhook endpoints so anyone (Slack bot, web UI, curl) can trigger
+Provides endpoints so anyone (Slack bot, web UI, curl) can trigger
 an agent task and poll for results, without needing a local terminal.
+
+Features:
+    - API Key authentication (X-API-Key header or api_key query param)
+    - WebSocket real-time updates (/ws/{job_id})
+    - SQLite-backed persistent job storage
 
 Usage:
     # One-time: store secrets in Modal
     modal secret create gemini-key GEMINI_API_KEY=AIza...
     modal secret create github-token GITHUB_TOKEN=ghp_...
+    modal secret create api-auth API_KEY=your-secret-key
 
     # Deploy (creates permanent public URLs)
     modal deploy api.py
@@ -16,122 +22,36 @@ Usage:
     modal serve api.py
 """
 
+import asyncio
+import json
 import modal
 import os
-import subprocess
+import time
 import uuid
-import json
-import re
-from datetime import datetime, timezone
+
+from shared import sandbox_image, setup_github_auth, clone_and_install, run_agent
+from models import (
+    db_volume, DB_DIR,
+    create_job, get_job, update_job, list_jobs, now_iso,
+)
+
+MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 10  # seconds, exponential: 10, 20, 40
 
 # ---------------------------------------------------------------------------
-# 1. Modal App + Shared Resources
+# 1. Modal App
 # ---------------------------------------------------------------------------
 
 app = modal.App("agent-api")
 
-# Persistent KV store — survives across function invocations & deploys.
-# Each key is a job_id (str), each value is a JobRecord dict (serialised).
-job_store = modal.Dict.from_name("agent-jobs", create_if_missing=True)
-
 # ---------------------------------------------------------------------------
-# 2. Container Image (same as sandbox.py)
-# ---------------------------------------------------------------------------
-
-sandbox_image = (
-    modal.Image.debian_slim()
-    .apt_install("git", "curl", "python3")
-    .pip_install("fastapi[standard]")
-    .run_commands(
-        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
-        "apt-get install -y nodejs",
-    )
-    .run_commands(
-        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-        "| dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg",
-        'echo "deb [arch=$(dpkg --print-architecture) '
-        "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
-        'https://cli.github.com/packages stable main" '
-        "| tee /etc/apt/sources.list.d/github-cli.list > /dev/null",
-        "apt-get update && apt-get install -y gh",
-    )
-    .add_local_dir(
-        local_path=".",
-        remote_path="/app",
-        ignore=["dummy-workspace/**", "node_modules/**"],
-    )
-)
-
-# ---------------------------------------------------------------------------
-# 3. Helpers
-# ---------------------------------------------------------------------------
-
-def _now() -> str:
-    """ISO-8601 timestamp in UTC."""
-    return datetime.now(timezone.utc).isoformat()
-
-
-_JOB_INDEX_KEY = "__job_index__"
-
-
-def _make_job(job_id: str, repo_url: str, task: str, user_id: str = "") -> dict:
-    """Create a fresh job record and register it in the global index."""
-    record = {
-        "job_id": job_id,
-        "status": "queued",
-        "repo_url": repo_url,
-        "task": task,
-        "submitted_by": user_id,
-        "submitted_at": _now(),
-        "started_at": None,
-        "completed_at": None,
-        "result": None,
-        "error": None,
-        "logs": [],
-    }
-    # Store the record
-    job_store[job_id] = record
-
-    # Append to the global index so we can list all jobs later
-    try:
-        index = job_store[_JOB_INDEX_KEY]
-    except KeyError:
-        index = []
-    index.append(job_id)
-    job_store[_JOB_INDEX_KEY] = index
-
-    return record
-
-
-def _update_job(job_id: str, **fields) -> dict:
-    """Read-modify-write a job record in the Dict store."""
-    record = job_store[job_id]
-    record.update(fields)
-    job_store[job_id] = record
-    return record
-
-
-def _list_jobs() -> list[dict]:
-    """Return all job records, newest first."""
-    try:
-        index = job_store[_JOB_INDEX_KEY]
-    except KeyError:
-        return []
-    records = []
-    for jid in reversed(index):  # newest first
-        try:
-            records.append(job_store[jid])
-        except KeyError:
-            pass
-    return records
-
-# ---------------------------------------------------------------------------
-# 4. Async Agent Task — runs in the background after spawn()
+# 2. Async Agent Task — runs in the background after spawn()
 # ---------------------------------------------------------------------------
 
 @app.function(
     image=sandbox_image,
     timeout=1800,
+    volumes={DB_DIR: db_volume},
     secrets=[
         modal.Secret.from_name("gemini-key", required_keys=["GEMINI_API_KEY"]),
         modal.Secret.from_name("github-token", required_keys=["GITHUB_TOKEN"]),
@@ -140,144 +60,138 @@ def _list_jobs() -> list[dict]:
 def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""):
     """
     The heavy lifter — runs entirely in Modal cloud.
-    Identical logic to sandbox.py's run_agent_in_cloud, but wrapped with
-    job-store status updates so callers can poll for progress.
+    Uses shared.py for auth, clone, install, and agent execution.
+    Supports automatic retry with exponential backoff (up to MAX_ATTEMPTS).
     """
-
-    # Use caller-supplied token, fall back to Modal secret
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
 
-    # ── Mark job as running ────────────────────────────────────────────────
-    _update_job(job_id, status="running", started_at=_now())
+    update_job(job_id, status="running", started_at=now_iso())
 
-    try:
-        # ── GitHub CLI authentication ──────────────────────────────────────
-        _update_job(job_id, logs=["Authenticating with GitHub..."])
-        proc = subprocess.run(
-            ["gh", "auth", "login", "--with-token"],
-            input=token, text=True, capture_output=True,
-        )
-        if proc.returncode != 0:
-            print(f"[Cloud] gh auth warning: {proc.stderr.strip()}")
-
-        subprocess.run(["gh", "auth", "status"], check=False)
-
-        # ── Git identity ───────────────────────────────────────────────────
-        subprocess.run(
-            ["git", "config", "--global", "user.name", "Cloud Agent"], check=True
-        )
-        subprocess.run(
-            ["git", "config", "--global", "user.email", "agent@cloud.bot"], check=True
-        )
-
-        # ── Git credential store ───────────────────────────────────────────
-        subprocess.run(
-            ["git", "config", "--global", "credential.helper", "store"], check=True
-        )
-        with open(os.path.expanduser("~/.git-credentials"), "w") as f:
-            f.write(f"https://x-access-token:{token}@github.com\n")
-
-        # ── Clone ──────────────────────────────────────────────────────────
-        _update_job(job_id, logs=["Cloning repository..."])
-        subprocess.run(["git", "clone", repo_url, "/app/workspace"], check=True)
-
-        # ── Install deps ───────────────────────────────────────────────────
-        os.chdir("/app")
-        _update_job(job_id, logs=["Installing dependencies..."])
-        subprocess.run(["npm", "install"], check=True)
-        subprocess.run(["npm", "install", "-g", "opencode-ai"], check=True)
-
-        # SDK symlink fix
-        os.makedirs("node_modules/@opencode-ai/sdk/dist", exist_ok=True)
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            os.symlink("src/index.js", "node_modules/@opencode-ai/sdk/dist/index.js")
-        except FileExistsError:
-            pass
+            update_job(
+                job_id,
+                attempt=attempt,
+                logs=[f"[Attempt {attempt}/{MAX_ATTEMPTS}] Authenticating with GitHub..."],
+            )
+            setup_github_auth(token)
 
-        # ── Run the Node.js agent engine ───────────────────────────────────
-        _update_job(job_id, logs=["Agent engine starting..."])
+            update_job(job_id, logs=[f"[Attempt {attempt}/{MAX_ATTEMPTS}] Cloning repository..."])
+            clone_and_install(repo_url)
 
-        env = os.environ.copy()
-        env["TASK_DESCRIPTION"] = task
+            update_job(job_id, logs=[f"[Attempt {attempt}/{MAX_ATTEMPTS}] Agent engine starting..."])
+            result = run_agent(task)
 
-        result = subprocess.run(
-            ["npm", "run", "dev"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=1500,  # leave some headroom within the 1800s function timeout
-        )
+            update_job(
+                job_id,
+                status="completed",
+                completed_at=now_iso(),
+                attempt=attempt,
+                result={
+                    "pr_url": result["pr_url"],
+                    "summary": (
+                        f"Agent finished. PR: {result['pr_url']}"
+                        if result["pr_url"]
+                        else "Agent finished (no PR URL detected)."
+                    ),
+                    "exit_code": result["exit_code"],
+                },
+                logs=result["log_lines"],
+            )
 
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        combined_output = stdout + "\n" + stderr
+            db_volume.commit()
+            return {"status": "completed", "pr_url": result["pr_url"]}
 
-        # ── Extract PR URL from agent output ───────────────────────────────
-        pr_url = None
-        for line in combined_output.splitlines():
-            if "github.com" in line and "/pull/" in line:
-                match = re.search(r"https://github\.com/[^\s\"']+/pull/\d+", line)
-                if match:
-                    pr_url = match.group(0)
-                    break
+        except Exception as exc:
+            last_error = exc
+            error_msg = str(exc)[:500]
 
-        # Grab last ~50 meaningful log lines for the job record
-        log_lines = [
-            l for l in combined_output.splitlines()
-            if l.strip() and not l.startswith(">")
-        ][-50:]
-
-        # ── Mark completed ─────────────────────────────────────────────────
-        _update_job(
-            job_id,
-            status="completed",
-            completed_at=_now(),
-            result={
-                "pr_url": pr_url,
-                "summary": f"Agent finished. PR: {pr_url}" if pr_url else "Agent finished (no PR URL detected).",
-                "exit_code": result.returncode,
-            },
-            logs=log_lines,
-        )
-
-        return {"status": "completed", "pr_url": pr_url}
-
-    except Exception as exc:
-        _update_job(
-            job_id,
-            status="failed",
-            completed_at=_now(),
-            error=str(exc)[:500],
-        )
-        raise
+            if attempt < MAX_ATTEMPTS:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                update_job(
+                    job_id,
+                    status="retrying",
+                    attempt=attempt,
+                    error=f"Attempt {attempt} failed: {error_msg}. Retrying in {delay}s...",
+                )
+                db_volume.commit()
+                time.sleep(delay)
+            else:
+                update_job(
+                    job_id,
+                    status="failed",
+                    completed_at=now_iso(),
+                    attempt=attempt,
+                    error=f"All {MAX_ATTEMPTS} attempts failed. Last error: {error_msg}",
+                )
+                db_volume.commit()
+                raise last_error
 
 
 # ---------------------------------------------------------------------------
-# 5. HTTP API — single FastAPI app with CORS
+# 3. HTTP API — FastAPI app with CORS, Auth, and WebSocket
 # ---------------------------------------------------------------------------
 
 api_image = modal.Image.debian_slim().pip_install("fastapi[standard]")
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocketState
 
 web_app = FastAPI(title="Agent API")
 
 web_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------------------------------------------------------------------------
+# 3a. API Key Authentication
+# ---------------------------------------------------------------------------
+
+PUBLIC_PATHS = {"/health", "/ws"}
+
+
+async def verify_api_key(request: Request):
+    """Check API key from header or query param. Skip for public paths."""
+    # Allow WebSocket and health without auth
+    if request.url.path == "/health" or request.url.path.startswith("/ws/"):
+        return
+
+    expected_key = os.environ.get("API_KEY", "")
+    if not expected_key:
+        # No key configured — auth disabled (development mode)
+        return
+
+    provided_key = (
+        request.headers.get("X-API-Key")
+        or request.query_params.get("api_key")
+        or ""
+    )
+
+    if provided_key != expected_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# Apply auth to all routes via dependency
+web_app.dependency_overrides = {}
+
+
+# ---------------------------------------------------------------------------
+# 3b. Endpoints
+# ---------------------------------------------------------------------------
+
 @web_app.get("/health")
 def ep_health():
-    return {"status": "ok", "timestamp": _now()}
+    return {"status": "ok", "timestamp": now_iso()}
 
 
-@web_app.post("/submit")
+@web_app.post("/submit", dependencies=[Depends(verify_api_key)])
 async def ep_submit(request: Request):
     body = await request.json()
 
@@ -293,7 +207,7 @@ async def ep_submit(request: Request):
     user_id = body.get("user_id", "anonymous")
 
     job_id = str(uuid.uuid4())
-    record = _make_job(job_id, repo_url, task, user_id)
+    record = create_job(job_id, repo_url, task, user_id)
 
     # Fire and forget — the task runs in the background
     run_agent_task.spawn(job_id, repo_url, task, github_token)
@@ -305,11 +219,10 @@ async def ep_submit(request: Request):
     }
 
 
-@web_app.get("/status/{job_id}")
+@web_app.get("/status/{job_id}", dependencies=[Depends(verify_api_key)])
 def ep_status(job_id: str):
-    try:
-        record = job_store[job_id]
-    except KeyError:
+    record = get_job(job_id)
+    if not record:
         return JSONResponse({"error": f"Job '{job_id}' not found."}, status_code=404)
 
     return {
@@ -321,11 +234,10 @@ def ep_status(job_id: str):
     }
 
 
-@web_app.get("/result/{job_id}")
+@web_app.get("/result/{job_id}", dependencies=[Depends(verify_api_key)])
 def ep_result(job_id: str):
-    try:
-        record = job_store[job_id]
-    except KeyError:
+    record = get_job(job_id)
+    if not record:
         return JSONResponse({"error": f"Job '{job_id}' not found."}, status_code=404)
 
     return {
@@ -343,10 +255,10 @@ def ep_result(job_id: str):
     }
 
 
-@web_app.get("/jobs")
+@web_app.get("/jobs", dependencies=[Depends(verify_api_key)])
 def ep_jobs():
     """List all jobs, newest first. Returns summary (no logs)."""
-    jobs = _list_jobs()
+    jobs = list_jobs()
     return [
         {
             "job_id": j["job_id"],
@@ -363,8 +275,78 @@ def ep_jobs():
     ]
 
 
+# ---------------------------------------------------------------------------
+# 3c. WebSocket — real-time job updates
+# ---------------------------------------------------------------------------
+
+@web_app.websocket("/ws/{job_id}")
+async def ws_job(websocket: WebSocket, job_id: str):
+    """
+    Stream real-time updates for a specific job.
+
+    Polls the database and pushes changes to the client whenever
+    the job status or logs change.  The connection closes automatically
+    when the job reaches a terminal state (completed/failed).
+    """
+    await websocket.accept()
+
+    last_status = None
+    last_log_count = 0
+
+    try:
+        while True:
+            # Reload volume to see latest writes from the agent task
+            db_volume.reload()
+
+            record = get_job(job_id)
+            if not record:
+                await websocket.send_json({"error": f"Job '{job_id}' not found."})
+                break
+
+            current_status = record["status"]
+            current_logs = record.get("logs", [])
+
+            # Send update if something changed
+            if current_status != last_status or len(current_logs) != last_log_count:
+                # Only send new log lines
+                new_logs = current_logs[last_log_count:]
+                await websocket.send_json({
+                    "type": "update",
+                    "job_id": job_id,
+                    "status": current_status,
+                    "started_at": record.get("started_at"),
+                    "completed_at": record.get("completed_at"),
+                    "result": record.get("result"),
+                    "error": record.get("error"),
+                    "new_logs": new_logs,
+                    "total_logs": len(current_logs),
+                })
+                last_status = current_status
+                last_log_count = len(current_logs)
+
+            # Stop streaming on terminal states
+            if current_status in ("completed", "failed"):
+                await websocket.send_json({"type": "done", "status": current_status})
+                break
+
+            await asyncio.sleep(2)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close()
+
+
+# ---------------------------------------------------------------------------
 # Mount the FastAPI app onto a single Modal function
-@app.function(image=api_image)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=api_image,
+    volumes={DB_DIR: db_volume},
+    secrets=[modal.Secret.from_name("api-auth", required_keys=["API_KEY"])],
+)
 @modal.asgi_app()
 def api():
     return web_app

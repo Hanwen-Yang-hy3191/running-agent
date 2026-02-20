@@ -1,16 +1,25 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import "./App.css";
 
 // ── Configuration ────────────────────────────────────────────────────────────
 const API_BASE = "https://hanwen-yang-hy3191--agent-api-api.modal.run";
+const WS_BASE = API_BASE.replace(/^http/, "ws");
 const POLL_INTERVAL = 5000;
 
 // ── API helpers ──────────────────────────────────────────────────────────────
+function getApiKey() {
+  return localStorage.getItem("agent_api_key") || "";
+}
+
 async function api(path, options = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  const apiKey = getApiKey();
+  const headers = { "Content-Type": "application/json", ...options.headers };
+  if (apiKey) headers["X-API-Key"] = apiKey;
+
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  if (res.status === 401) {
+    throw new Error("AUTH_REQUIRED");
+  }
   return res.json();
 }
 
@@ -18,6 +27,7 @@ async function api(path, options = {}) {
 const STATUS_STYLES = {
   queued:    { bg: "#fef3c7", color: "#92400e", label: "Queued" },
   running:   { bg: "#dbeafe", color: "#1e40af", label: "Running" },
+  retrying:  { bg: "#fef3c7", color: "#d97706", label: "Retrying" },
   completed: { bg: "#d1fae5", color: "#065f46", label: "Completed" },
   failed:    { bg: "#fee2e2", color: "#991b1b", label: "Failed" },
 };
@@ -75,20 +85,89 @@ export default function App() {
   const [task, setTask] = useState("");
   const [ghToken, setGhToken] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [apiKey, setApiKey] = useState(getApiKey());
+  const [authError, setAuthError] = useState(false);
+  const [wsLogs, setWsLogs] = useState([]);
+
+  const wsRef = useRef(null);
+
+  // Save API key
+  const saveApiKey = (key) => {
+    setApiKey(key);
+    localStorage.setItem("agent_api_key", key);
+    setAuthError(false);
+  };
 
   // Fetch all jobs
-  const fetchJobs = async () => {
+  const fetchJobs = useCallback(async () => {
     try {
       const data = await api("/jobs");
       setJobs(Array.isArray(data) ? data : []);
-    } catch (e) { console.error("Failed to fetch jobs:", e); }
-    finally { setLoading(false); }
-  };
+      setAuthError(false);
+    } catch (e) {
+      if (e.message === "AUTH_REQUIRED") {
+        setAuthError(true);
+      } else {
+        console.error("Failed to fetch jobs:", e);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     fetchJobs();
     const t = setInterval(fetchJobs, POLL_INTERVAL);
     return () => clearInterval(t);
+  }, [fetchJobs]);
+
+  // WebSocket connection for selected job
+  const connectWs = useCallback((jobId) => {
+    // Close existing connection
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    setWsLogs([]);
+    const ws = new WebSocket(`${WS_BASE}/ws/${jobId}`);
+    wsRef.current = ws;
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === "update") {
+        setSelected(prev => prev ? {
+          ...prev,
+          status: data.status,
+          started_at: data.started_at,
+          completed_at: data.completed_at,
+          result: data.result,
+          error: data.error,
+        } : prev);
+        if (data.new_logs?.length > 0) {
+          setWsLogs(prev => [...prev, ...data.new_logs]);
+        }
+      } else if (data.type === "done") {
+        // Refresh full job details on completion
+        selectJob(jobId);
+        fetchJobs();
+      }
+    };
+
+    ws.onerror = () => {
+      console.warn("WebSocket error, falling back to polling");
+    };
+
+    ws.onclose = () => {
+      wsRef.current = null;
+    };
+  }, []);
+
+  // Cleanup WebSocket on unmount
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) wsRef.current.close();
+    };
   }, []);
 
   // Fetch selected job detail
@@ -96,12 +175,22 @@ export default function App() {
     try {
       const data = await api(`/result/${jobId}`);
       setSelected(data);
-    } catch (e) { console.error(e); }
+      setWsLogs(data.logs || []);
+
+      // Connect WebSocket for live updates if job is active
+      if (data.status === "queued" || data.status === "running" || data.status === "retrying") {
+        connectWs(jobId);
+      }
+    } catch (e) {
+      if (e.message === "AUTH_REQUIRED") setAuthError(true);
+      else console.error(e);
+    }
   };
 
-  // Auto-refresh active job
+  // Auto-refresh active job (fallback when WebSocket is not connected)
   useEffect(() => {
     if (!selected || selected.status === "completed" || selected.status === "failed") return;
+    if (wsRef.current) return; // WebSocket is handling updates
     const t = setInterval(() => selectJob(selected.job_id), POLL_INTERVAL);
     return () => clearInterval(t);
   }, [selected]);
@@ -118,8 +207,12 @@ export default function App() {
       setRepoUrl(""); setTask("");
       await fetchJobs();
       if (data.job_id) selectJob(data.job_id);
-    } catch (e) { console.error(e); }
-    finally { setSubmitting(false); }
+    } catch (e) {
+      if (e.message === "AUTH_REQUIRED") setAuthError(true);
+      else console.error(e);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -134,6 +227,26 @@ export default function App() {
           <p style={{ margin: "4px 0 0", fontSize: 13, color: "#64748b" }}>
             Background Coding Agent · {jobs.length} job{jobs.length !== 1 ? "s" : ""}
           </p>
+        </div>
+
+        {/* API Key input */}
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid #e2e8f0", background: authError ? "#fef2f2" : "#f8fafc" }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="password"
+              placeholder="API Key"
+              value={apiKey}
+              onChange={e => saveApiKey(e.target.value)}
+              style={{ ...inputStyle, flex: 1, fontSize: 12 }}
+            />
+            <div style={{
+              fontSize: 11, display: "flex", alignItems: "center",
+              color: authError ? "#991b1b" : apiKey ? "#065f46" : "#94a3b8",
+              whiteSpace: "nowrap",
+            }}>
+              {authError ? "Invalid key" : apiKey ? "Connected" : "No key"}
+            </div>
+          </div>
         </div>
 
         <form onSubmit={handleSubmit} style={{
@@ -205,9 +318,14 @@ export default function App() {
             <div style={{ marginBottom: 24 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
                 <Badge status={selected.status} />
-                {selected.status === "running" && (
+                {(selected.status === "running" || selected.status === "retrying") && (
                   <span style={{ fontSize: 12, color: "#2563eb", fontWeight: 500 }}>
-                    Running for {duration(selected.started_at, null)}...
+                    {selected.status === "retrying" ? "Retrying" : "Running"} for {duration(selected.started_at, null)}...
+                  </span>
+                )}
+                {wsRef.current && (
+                  <span style={{ fontSize: 11, color: "#059669", fontWeight: 500 }}>
+                    LIVE
                   </span>
                 )}
               </div>
@@ -223,7 +341,7 @@ export default function App() {
                 color: "#fff", borderRadius: 8, textDecoration: "none", fontWeight: 600,
                 fontSize: 14, marginBottom: 20,
               }}>
-                View Pull Request →
+                View Pull Request
               </a>
             )}
 
@@ -243,7 +361,7 @@ export default function App() {
               <MetaCard label="Duration" value={duration(selected.started_at, selected.completed_at)} />
             </div>
 
-            {selected.logs?.length > 0 && (
+            {wsLogs.length > 0 && (
               <>
                 <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Agent Logs</h3>
                 <pre style={{
@@ -251,7 +369,7 @@ export default function App() {
                   fontSize: 11, lineHeight: 1.6, overflowX: "auto", maxHeight: 400,
                   whiteSpace: "pre-wrap", wordBreak: "break-all",
                 }}>
-                  {selected.logs.join("\n")}
+                  {wsLogs.join("\n")}
                 </pre>
               </>
             )}

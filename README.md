@@ -40,6 +40,7 @@ GitHub Pull Request
 ```bash
 modal secret create gemini-key GEMINI_API_KEY=your_gemini_key
 modal secret create github-token GITHUB_TOKEN=your_github_token
+modal secret create api-auth API_KEY=your_api_key
 ```
 
 ### 2. Deploy the API
@@ -55,6 +56,7 @@ This gives you a permanent public URL like `https://your-name--agent-api-api.mod
 ```bash
 curl -X POST https://your-name--agent-api-api.modal.run/submit \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your_api_key" \
   -d '{
     "repo_url": "https://github.com/you/your-repo.git",
     "task": "Add unit tests for the utils module"
@@ -101,6 +103,9 @@ Open `http://localhost:5173` — you can submit tasks, watch status updates, vie
 | `GET` | `/result/{job_id}` | Get full result (PR URL, logs, error) |
 | `GET` | `/jobs` | List all tasks |
 | `GET` | `/health` | Health check |
+| `WS` | `/ws/{job_id}` | WebSocket real-time job updates |
+
+All endpoints except `/health` and `/ws` require authentication via `X-API-Key` header or `api_key` query parameter. If no `API_KEY` secret is configured, auth is disabled (development mode).
 
 ### POST /submit
 
@@ -117,13 +122,15 @@ Open `http://localhost:5173` — you can submit tasks, watch status updates, vie
 
 ```
 running_agent/
-├── api.py              # Phase 4 — HTTP API + async job management
-├── sandbox.py          # Phase 2/3 — CLI-triggered cloud execution
+├── api.py              # HTTP API + async job management + WebSocket
+├── sandbox.py          # CLI-triggered cloud execution
+├── shared.py           # Shared infrastructure (image, auth, agent runner)
+├── models.py           # SQLite data models + database access layer
 ├── src/
 │   └── index.ts        # Agent engine — OpenCode SDK + Git PR workflow
 ├── opencode.json       # LLM provider config (Gemini)
 ├── dashboard/          # React web UI
-│   └── src/App.jsx     # Single-file dashboard app
+│   └── src/App.jsx     # Dashboard app with WebSocket support
 └── package.json
 ```
 
@@ -135,9 +142,9 @@ running_agent/
 
 **Phase 3 — Git PR Loop:** The agent creates branches, commits, pushes, and opens PRs autonomously via a structured system prompt.
 
-**Phase 4 — HTTP API:** Modal web endpoints expose an async job queue. Submit tasks via HTTP, poll for status, get results. State persists in Modal Dict.
+**Phase 4 — HTTP API:** Modal web endpoints expose an async job queue with API key authentication, WebSocket real-time updates, error retry (3 attempts with exponential backoff), and SQLite-backed persistent storage.
 
-**Phase 5 — Dashboard:** React frontend for visual task management (current).
+**Phase 5 — Dashboard:** React frontend for visual task management with WebSocket live updates and API key support.
 
 ## Tech Stack
 
