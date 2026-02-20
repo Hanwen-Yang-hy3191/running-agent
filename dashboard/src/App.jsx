@@ -14,22 +14,20 @@ async function api(path, options = {}) {
 }
 
 // ── Status badge ─────────────────────────────────────────────────────────────
-const STATUS_STYLES = {
-  queued:    { bg: "#fef3c7", color: "#92400e", label: "Queued" },
-  running:   { bg: "#dbeafe", color: "#1e40af", label: "Running" },
-  retrying:  { bg: "#fef3c7", color: "#d97706", label: "Retrying" },
-  completed: { bg: "#d1fae5", color: "#065f46", label: "Completed" },
-  failed:    { bg: "#fee2e2", color: "#991b1b", label: "Failed" },
+const STATUS_MAP = {
+  queued:    "Queued",
+  running:   "Running",
+  retrying:  "Retrying",
+  completed: "Completed",
+  failed:    "Failed",
 };
 
 function Badge({ status }) {
-  const s = STATUS_STYLES[status] || STATUS_STYLES.queued;
+  const label = STATUS_MAP[status] || "Queued";
   return (
-    <span style={{
-      padding: "3px 10px", borderRadius: 12, fontSize: 12,
-      fontWeight: 600, background: s.bg, color: s.color, whiteSpace: "nowrap",
-    }}>
-      {s.label}
+    <span className={`badge badge-${status || "queued"}`}>
+      <span className="badge-dot" />
+      {label}
     </span>
   );
 }
@@ -40,31 +38,39 @@ function timeAgo(iso) {
   const diff = (Date.now() - new Date(iso).getTime()) / 1000;
   if (diff < 60) return `${Math.round(diff)}s ago`;
   if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-  return `${Math.round(diff / 3600)}h ago`;
+  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+  return `${Math.round(diff / 86400)}d ago`;
 }
 
 function duration(start, end) {
-  if (!start) return "";
+  if (!start) return "—";
   const s = new Date(start).getTime();
   const e = end ? new Date(end).getTime() : Date.now();
   const sec = Math.round((e - s) / 1000);
-  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`;
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const rs = sec % 60;
+  return `${m}m ${rs}s`;
 }
 
-function MetaCard({ label, value }) {
-  return (
-    <div style={{ padding: 12, background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
-      <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>{label}</div>
-      <div style={{ fontSize: 13, fontWeight: 500 }}>{value || "—"}</div>
-    </div>
-  );
+function formatTime(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString(undefined, {
+    month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
 }
 
-const inputStyle = {
-  padding: "8px 12px", border: "1px solid #d1d5db", borderRadius: 8,
-  fontSize: 13, outline: "none", width: "100%", boxSizing: "border-box",
-  color: "#1a1a2e", background: "#fff",
-};
+// ── Log line colorizer ──────────────────────────────────────────────────────
+function classifyLogLine(line) {
+  if (/\[TOOL/.test(line)) return "log-line-tool";
+  if (/\[THOUGHT|REASONING/.test(line)) return "log-line-thought";
+  if (/\[STEP/.test(line)) return "log-line-step";
+  if (/\[SESSION/.test(line)) return "log-line-session";
+  if (/ERROR|WARN|error|fail/i.test(line)) return "log-line-error";
+  if (/\[FILE/.test(line)) return "log-line-file";
+  return "";
+}
 
 // ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
@@ -74,13 +80,19 @@ export default function App() {
   const [repoUrl, setRepoUrl] = useState("");
   const [task, setTask] = useState("");
   const [ghToken, setGhToken] = useState("");
+  const [showToken, setShowToken] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [wsLogs, setWsLogs] = useState([]);
 
   const wsRef = useRef(null);
-  // Refs to hold latest function versions for WebSocket callbacks
   const selectJobRef = useRef(null);
   const fetchJobsRef = useRef(null);
+  const logsEndRef = useRef(null);
+
+  // Auto-scroll logs
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [wsLogs]);
 
   // Fetch all jobs
   const fetchJobs = useCallback(async () => {
@@ -170,7 +182,7 @@ export default function App() {
   // Auto-refresh active job (fallback when WebSocket is not connected)
   useEffect(() => {
     if (!selected || selected.status === "completed" || selected.status === "failed") return;
-    if (wsRef.current) return; // WebSocket is handling updates
+    if (wsRef.current) return;
     const t = setInterval(() => selectJobRef.current?.(selected.job_id), POLL_INTERVAL);
     return () => clearInterval(t);
   }, [selected]);
@@ -194,149 +206,221 @@ export default function App() {
     }
   };
 
+  // Group jobs into active (queued/running/retrying) and completed
+  const activeJobs = jobs.filter(j => ["queued", "running", "retrying"].includes(j.status));
+  const doneJobs = jobs.filter(j => ["completed", "failed"].includes(j.status));
+
   return (
-    <div style={{ display: "flex", height: "100vh", color: "#1a1a2e" }}>
-      {/* ── Left Panel ─────────────────────────────────────── */}
-      <div style={{
-        width: 420, minWidth: 420, borderRight: "1px solid #e2e8f0",
-        display: "flex", flexDirection: "column", background: "#f8fafc",
-      }}>
-        <div style={{ padding: "20px 20px 12px", borderBottom: "1px solid #e2e8f0" }}>
-          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>Agent Dashboard</h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: "#64748b" }}>
-            Background Coding Agent · {jobs.length} job{jobs.length !== 1 ? "s" : ""}
-          </p>
+    <div className="app-layout">
+      {/* ── Sidebar ──────────────────────────────────────── */}
+      <div className="sidebar">
+        <div className="sidebar-header">
+          <h1><span className="logo-dot" /> Agent Console</h1>
+          <div className="sidebar-subtitle">
+            {jobs.length} job{jobs.length !== 1 ? "s" : ""}
+            {activeJobs.length > 0 && ` · ${activeJobs.length} active`}
+          </div>
         </div>
 
-        <form onSubmit={handleSubmit} style={{
-          padding: 16, borderBottom: "1px solid #e2e8f0",
-          display: "flex", flexDirection: "column", gap: 10,
-        }}>
-          <input type="text" placeholder="Repository URL (https://github.com/...)"
-            value={repoUrl} onChange={e => setRepoUrl(e.target.value)} style={inputStyle} />
-          <textarea placeholder="Task description — what should the agent do?"
-            value={task} onChange={e => setTask(e.target.value)} rows={3}
-            style={{ ...inputStyle, resize: "vertical", fontFamily: "inherit" }} />
-          <input type="password" placeholder="GitHub Token (optional — uses server default)"
-            value={ghToken} onChange={e => setGhToken(e.target.value)} style={inputStyle} />
-          <button type="submit" disabled={submitting || !repoUrl.trim() || !task.trim()} style={{
-            padding: "10px 16px", background: submitting ? "#94a3b8" : "#2563eb",
-            color: "#fff", border: "none", borderRadius: 8, fontSize: 14,
-            fontWeight: 600, cursor: submitting ? "not-allowed" : "pointer",
-          }}>
-            {submitting ? "Submitting..." : "Submit Task"}
-          </button>
-        </form>
-
-        <div style={{ flex: 1, overflowY: "auto" }}>
+        <div className="job-list">
           {loading ? (
-            <p style={{ padding: 20, color: "#94a3b8", textAlign: "center" }}>Loading...</p>
+            <div className="no-jobs">Loading...</div>
           ) : jobs.length === 0 ? (
-            <p style={{ padding: 20, color: "#94a3b8", textAlign: "center" }}>No jobs yet. Submit your first task above.</p>
-          ) : jobs.map(job => (
-            <div key={job.job_id} onClick={() => selectJob(job.job_id)} style={{
-              padding: "12px 16px", borderBottom: "1px solid #e2e8f0", cursor: "pointer",
-              background: selected?.job_id === job.job_id ? "#e0e7ff" : "transparent",
-              transition: "background 0.15s",
-            }}
-              onMouseEnter={e => { if (selected?.job_id !== job.job_id) e.currentTarget.style.background = "#f1f5f9"; }}
-              onMouseLeave={e => { if (selected?.job_id !== job.job_id) e.currentTarget.style.background = "transparent"; }}
+            <div className="no-jobs">No jobs yet. Submit your first task below.</div>
+          ) : (
+            <>
+              {activeJobs.length > 0 && (
+                <>
+                  <div className="job-group-label">Active</div>
+                  {activeJobs.map(job => (
+                    <JobItem
+                      key={job.job_id}
+                      job={job}
+                      isActive={selected?.job_id === job.job_id}
+                      onClick={() => selectJob(job.job_id)}
+                    />
+                  ))}
+                </>
+              )}
+              {doneJobs.length > 0 && (
+                <>
+                  <div className="job-group-label">History</div>
+                  {doneJobs.map(job => (
+                    <JobItem
+                      key={job.job_id}
+                      job={job}
+                      isActive={selected?.job_id === job.job_id}
+                      onClick={() => selectJob(job.job_id)}
+                    />
+                  ))}
+                </>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Submit form at bottom of sidebar */}
+        <div className="submit-section">
+          <form onSubmit={handleSubmit}>
+            <input
+              type="text"
+              className="form-input"
+              placeholder="Repository URL (https://github.com/...)"
+              value={repoUrl}
+              onChange={e => setRepoUrl(e.target.value)}
+            />
+            <textarea
+              className="form-input form-textarea"
+              placeholder="What should the agent do?"
+              value={task}
+              onChange={e => setTask(e.target.value)}
+              rows={2}
+            />
+            {showToken ? (
+              <input
+                type="password"
+                className="form-input"
+                placeholder="GitHub Token (optional)"
+                value={ghToken}
+                onChange={e => setGhToken(e.target.value)}
+              />
+            ) : (
+              <button type="button" className="token-toggle" onClick={() => setShowToken(true)}>
+                + Add GitHub token (optional)
+              </button>
+            )}
+            <button
+              type="submit"
+              className="submit-btn"
+              disabled={submitting || !repoUrl.trim() || !task.trim()}
             >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                <Badge status={job.status} />
-                <span style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(job.submitted_at)}</span>
-              </div>
-              <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {job.task}
-              </div>
-              <div style={{ fontSize: 11, color: "#64748b", display: "flex", justifyContent: "space-between" }}>
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {job.repo_url?.replace("https://github.com/", "")}
-                </span>
-                {job.pr_url && (
-                  <a href={job.pr_url} target="_blank" rel="noopener noreferrer"
-                    onClick={e => e.stopPropagation()} style={{ color: "#059669", fontWeight: 600, marginLeft: 8 }}>
-                    PR
-                  </a>
-                )}
-              </div>
-            </div>
-          ))}
+              {submitting ? "Submitting..." : "Submit Task"}
+            </button>
+          </form>
         </div>
       </div>
 
-      {/* ── Right Panel: Detail ────────────────────────────── */}
-      <div style={{ flex: 1, overflowY: "auto", padding: 28, background: "#fff" }}>
+      {/* ── Main Panel ───────────────────────────────────── */}
+      <div className="main-panel">
         {!selected ? (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#94a3b8", flexDirection: "column", gap: 8 }}>
-            <div style={{ fontSize: 48, opacity: 0.5 }}>&#129302;</div>
-            <p>Select a job from the list to view details</p>
+          <div className="empty-state">
+            <div className="empty-state-icon">&#9672;</div>
+            <p>Select a job to view details</p>
           </div>
         ) : (
           <>
-            <div style={{ marginBottom: 24 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+            {/* Detail Header */}
+            <div className="detail-header">
+              <div className="detail-header-top">
                 <Badge status={selected.status} />
                 {(selected.status === "running" || selected.status === "retrying") && (
-                  <span style={{ fontSize: 12, color: "#2563eb", fontWeight: 500 }}>
-                    {selected.status === "retrying" ? "Retrying" : "Running"} for {duration(selected.started_at, null)}...
+                  <span className="running-timer">
+                    {duration(selected.started_at, null)}
                   </span>
                 )}
-                {wsRef.current && (
-                  <span style={{ fontSize: 11, color: "#059669", fontWeight: 500 }}>
-                    LIVE
-                  </span>
-                )}
+                {wsRef.current && <span className="live-tag">LIVE</span>}
               </div>
-              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>{selected.task}</h2>
-              <p style={{ margin: "6px 0 0", fontSize: 13, color: "#64748b" }}>
-                {selected.repo_url?.replace("https://github.com/", "")} · by {selected.submitted_by || "anonymous"}
-              </p>
+              <h2 className="detail-title">{selected.task}</h2>
+              <div className="detail-subtitle">
+                <span>{selected.repo_url?.replace("https://github.com/", "")}</span>
+                <span>·</span>
+                <span>{selected.submitted_by || "anonymous"}</span>
+              </div>
+
+              {selected.result?.pr_url && (
+                <a
+                  href={selected.result.pr_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="pr-link"
+                >
+                  &#8599; View Pull Request
+                </a>
+              )}
             </div>
 
-            {selected.result?.pr_url && (
-              <a href={selected.result.pr_url} target="_blank" rel="noopener noreferrer" style={{
-                display: "inline-block", padding: "10px 20px", background: "#059669",
-                color: "#fff", borderRadius: 8, textDecoration: "none", fontWeight: 600,
-                fontSize: 14, marginBottom: 20,
-              }}>
-                View Pull Request
-              </a>
-            )}
-
+            {/* Error banner */}
             {selected.error && (
-              <div style={{
-                padding: 12, background: "#fef2f2", border: "1px solid #fecaca",
-                borderRadius: 8, marginBottom: 20, fontSize: 13, color: "#991b1b",
-              }}>
+              <div className="error-banner">
                 <strong>Error:</strong> {selected.error}
               </div>
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 24 }}>
-              <MetaCard label="Submitted" value={selected.submitted_at && new Date(selected.submitted_at).toLocaleString()} />
-              <MetaCard label="Started" value={selected.started_at && new Date(selected.started_at).toLocaleString()} />
-              <MetaCard label="Completed" value={selected.completed_at && new Date(selected.completed_at).toLocaleString()} />
-              <MetaCard label="Duration" value={duration(selected.started_at, selected.completed_at)} />
+            {/* Meta grid */}
+            <div className="meta-grid">
+              <div className="meta-card">
+                <div className="meta-card-label">Submitted</div>
+                <div className="meta-card-value">{formatTime(selected.submitted_at)}</div>
+              </div>
+              <div className="meta-card">
+                <div className="meta-card-label">Started</div>
+                <div className="meta-card-value">{formatTime(selected.started_at)}</div>
+              </div>
+              <div className="meta-card">
+                <div className="meta-card-label">Completed</div>
+                <div className="meta-card-value">{formatTime(selected.completed_at)}</div>
+              </div>
+              <div className="meta-card">
+                <div className="meta-card-label">Duration</div>
+                <div className="meta-card-value">{duration(selected.started_at, selected.completed_at)}</div>
+              </div>
             </div>
 
+            {/* Agent Logs */}
             {wsLogs.length > 0 && (
-              <>
-                <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Agent Logs</h3>
-                <pre style={{
-                  background: "#1e293b", color: "#e2e8f0", padding: 16, borderRadius: 8,
-                  fontSize: 11, lineHeight: 1.6, overflowX: "auto", maxHeight: 400,
-                  whiteSpace: "pre-wrap", wordBreak: "break-all",
-                }}>
-                  {wsLogs.join("\n")}
-                </pre>
-              </>
+              <div className="logs-section">
+                <div className="logs-header">
+                  <h3>Agent Logs</h3>
+                  <span className="log-count">{wsLogs.length} lines</span>
+                </div>
+                <div className="logs-container">
+                  {wsLogs.map((line, i) => (
+                    <div key={i} className={classifyLogLine(line)}>{line}</div>
+                  ))}
+                  <div ref={logsEndRef} />
+                </div>
+              </div>
             )}
 
-            <p style={{ marginTop: 20, fontSize: 11, color: "#94a3b8" }}>
-              Job ID: <code>{selected.job_id}</code>
-            </p>
+            {/* Footer */}
+            <div className="detail-footer">
+              Job ID: {selected.job_id}
+            </div>
           </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Job list item component ──────────────────────────────────────────────────
+function JobItem({ job, isActive, onClick }) {
+  return (
+    <div
+      className={`job-item${isActive ? " active" : ""}`}
+      onClick={onClick}
+    >
+      <div className="job-item-top">
+        <Badge status={job.status} />
+        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+          {timeAgo(job.submitted_at)}
+        </span>
+      </div>
+      <div className="job-item-task">{job.task}</div>
+      <div className="job-item-meta">
+        <span className="job-item-repo">
+          {job.repo_url?.replace("https://github.com/", "")}
+        </span>
+        {job.pr_url && (
+          <a
+            href={job.pr_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={e => e.stopPropagation()}
+            style={{ color: "var(--green)", fontWeight: 600, marginLeft: 8 }}
+          >
+            PR &#8599;
+          </a>
         )}
       </div>
     </div>

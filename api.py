@@ -48,6 +48,15 @@ WORKSPACE = "/app/workspace"
 
 app = modal.App("agent-api")
 
+# Lightweight image for API endpoints and pipeline orchestrator
+api_image = (
+    modal.Image.debian_slim()
+    .pip_install("fastapi[standard]")
+    .add_local_file("shared.py", "/root/shared.py")
+    .add_local_file("models.py", "/root/models.py")
+    .add_local_file("scheduler.py", "/root/scheduler.py")
+)
+
 # ---------------------------------------------------------------------------
 # 2. Async Agent Task — runs in the background after spawn()
 # ---------------------------------------------------------------------------
@@ -70,7 +79,15 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
     all_logs = []
 
+    # Ensure we have the latest DB state (API container committed the job record)
+    db_volume.reload()
+
+    job = get_job(job_id)
+    if not job:
+        raise RuntimeError(f"Job {job_id} not found in database after reload — possible volume sync issue")
+
     update_job(job_id, status="running", started_at=now_iso())
+    db_volume.commit()
 
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -176,7 +193,14 @@ def run_pipeline_step(
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
     all_logs = []
 
+    db_volume.reload()
+
+    job = get_job(job_id)
+    if not job:
+        raise RuntimeError(f"Pipeline step job {job_id} not found after reload")
+
     update_job(job_id, status="running", started_at=now_iso())
+    db_volume.commit()
 
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -254,7 +278,7 @@ def run_pipeline_step(
 # ---------------------------------------------------------------------------
 
 @app.function(
-    image=modal.Image.debian_slim().pip_install("fastapi[standard]"),
+    image=api_image,
     timeout=7200,  # pipelines can take longer
     volumes={DB_DIR: db_volume},
 )
@@ -269,6 +293,7 @@ def run_pipeline_task(
     Orchestrate a full pipeline run: execute steps in DAG order,
     passing upstream outputs to downstream steps.
     """
+    db_volume.reload()
     try:
         _execute_pipeline_steps(run_id, pipeline_id, repo_url, steps, github_token)
     except Exception as exc:
@@ -388,8 +413,6 @@ def _execute_pipeline_steps(
 # 3. HTTP API — FastAPI app with CORS and WebSocket
 # ---------------------------------------------------------------------------
 
-api_image = modal.Image.debian_slim().pip_install("fastapi[standard]")
-
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -431,6 +454,7 @@ async def ep_submit(request: Request):
 
     job_id = str(uuid.uuid4())
     record = create_job(job_id, repo_url, task, user_id)
+    db_volume.commit()  # ensure the spawned container can see this job
 
     # Fire and forget — the task runs in the background
     run_agent_task.spawn(job_id, repo_url, task, github_token)
@@ -444,6 +468,7 @@ async def ep_submit(request: Request):
 
 @web_app.get("/status/{job_id}")
 def ep_status(job_id: str):
+    db_volume.reload()
     record = get_job(job_id)
     if not record:
         return JSONResponse({"error": f"Job '{job_id}' not found."}, status_code=404)
@@ -459,6 +484,7 @@ def ep_status(job_id: str):
 
 @web_app.get("/result/{job_id}")
 def ep_result(job_id: str):
+    db_volume.reload()
     record = get_job(job_id)
     if not record:
         return JSONResponse({"error": f"Job '{job_id}' not found."}, status_code=404)
@@ -481,6 +507,7 @@ def ep_result(job_id: str):
 @web_app.get("/jobs")
 def ep_jobs():
     """List all jobs, newest first. Returns summary (no logs)."""
+    db_volume.reload()
     jobs = list_jobs()
     return [
         {
@@ -540,18 +567,21 @@ async def ep_create_pipeline(request: Request):
     repo_url = body.get("repo_url", "")
 
     record = create_pipeline(pipeline_id, name, repo_url, steps)
+    db_volume.commit()
     return record
 
 
 @web_app.get("/pipelines")
 def ep_list_pipelines():
     """List all pipeline definitions."""
+    db_volume.reload()
     return list_pipelines()
 
 
 @web_app.get("/pipelines/{pipeline_id}")
 def ep_get_pipeline(pipeline_id: str):
     """Get a pipeline definition by ID."""
+    db_volume.reload()
     record = get_pipeline(pipeline_id)
     if not record:
         return JSONResponse(
@@ -563,7 +593,9 @@ def ep_get_pipeline(pipeline_id: str):
 @web_app.delete("/pipelines/{pipeline_id}")
 def ep_delete_pipeline(pipeline_id: str):
     """Delete a pipeline definition."""
+    db_volume.reload()
     deleted = delete_pipeline(pipeline_id)
+    db_volume.commit()
     if not deleted:
         return JSONResponse(
             {"error": f"Pipeline '{pipeline_id}' not found."}, status_code=404
@@ -574,6 +606,7 @@ def ep_delete_pipeline(pipeline_id: str):
 @web_app.post("/pipelines/{pipeline_id}/run")
 async def ep_run_pipeline(pipeline_id: str, request: Request):
     """Trigger a pipeline execution."""
+    db_volume.reload()
     pipeline = get_pipeline(pipeline_id)
     if not pipeline:
         return JSONResponse(
@@ -595,6 +628,7 @@ async def ep_run_pipeline(pipeline_id: str, request: Request):
 
     run_id = str(uuid.uuid4())
     run = create_pipeline_run(run_id, pipeline_id, repo_url)
+    db_volume.commit()  # ensure the spawned container can see this run
 
     # Fire and forget — pipeline orchestrator runs in background
     run_pipeline_task.spawn(
@@ -612,12 +646,14 @@ async def ep_run_pipeline(pipeline_id: str, request: Request):
 @web_app.get("/pipelines/{pipeline_id}/runs")
 def ep_list_pipeline_runs(pipeline_id: str):
     """List all runs for a pipeline."""
+    db_volume.reload()
     return list_pipeline_runs(pipeline_id)
 
 
 @web_app.get("/runs/{run_id}")
 def ep_get_run(run_id: str):
     """Get pipeline run details including all step jobs."""
+    db_volume.reload()
     run = get_pipeline_run(run_id)
     if not run:
         return JSONResponse(

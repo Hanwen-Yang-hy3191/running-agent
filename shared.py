@@ -34,6 +34,7 @@ sandbox_image = (
         "| tee /etc/apt/sources.list.d/github-cli.list > /dev/null",
         "apt-get update && apt-get install -y gh",
     )
+    .env({"PYTHONPATH": "/app"})
     .add_local_dir(
         local_path=".",
         remote_path="/app",
