@@ -220,6 +220,10 @@ def update_job(job_id: str, **fields) -> Optional[dict]:
 
     fields["updated_at"] = now_iso()
 
+    # Guard against empty fields to prevent invalid SQL
+    if not fields:
+        return get_job(job_id)
+
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [job_id]
 
