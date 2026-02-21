@@ -33,6 +33,52 @@ interface ProjectDetection {
 // Project type detection
 // ---------------------------------------------------------------------------
 
+/**
+ * Check if a directory contains Python test files (unittest style).
+ * Looks for test_*.py and *_test.py patterns in the directory and subdirectories.
+ */
+function hasPythonTestFiles(workspace: string): boolean {
+  const testPatterns = [/^test_.*\.py$/, /^.*_test\.py$/];
+
+  function checkDir(dir: string, depth: number): boolean {
+    if (depth > 3) return false; // Limit recursion depth
+
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (IGNORE_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+          if (checkDir(path.join(dir, entry.name), depth + 1)) return true;
+        } else if (entry.isFile()) {
+          const name = entry.name;
+          if (testPatterns.some((pat) => pat.test(name))) return true;
+        }
+      }
+    } catch {
+      // Ignore read errors
+    }
+    return false;
+  }
+
+  return checkDir(workspace, 0);
+}
+
+// Directories to ignore when searching for test files
+const IGNORE_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".venv",
+  "venv",
+  "env",
+  ".tox",
+  "build",
+  "dist",
+  "target",
+]);
+
 function detectProject(workspace: string): ProjectDetection | null {
   // Node.js — check package.json scripts
   const packageJsonPath = path.join(workspace, "package.json");
@@ -62,13 +108,27 @@ function detectProject(workspace: string): ProjectDetection | null {
     fs.existsSync(path.join(workspace, "setup.cfg"));
 
   if (hasPyProject) {
+    // Check for tests/ directory
     const hasTestDir =
       fs.existsSync(path.join(workspace, "tests")) ||
       fs.existsSync(path.join(workspace, "test"));
 
+    // Also check for unittest-style test files (test_*.py, *_test.py)
+    const hasTestFiles = hasPythonTestFiles(workspace);
+
+    if (hasTestDir || hasTestFiles) {
+      // Use pytest if available (more common), fallback to unittest
+      // Note: We prefer pytest but if it fails, the agent can try unittest
+      return {
+        type: "python",
+        testCommand: "python -m pytest --tb=short -q",
+        buildCommand: null,
+      };
+    }
+
     return {
       type: "python",
-      testCommand: hasTestDir ? "python -m pytest --tb=short -q" : null,
+      testCommand: null,
       buildCommand: null,
     };
   }

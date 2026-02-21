@@ -78,7 +78,55 @@ curl https://your-name--agent-api-api.modal.run/status/JOB_ID
 curl https://your-name--agent-api-api.modal.run/result/JOB_ID
 ```
 
-Response includes the PR URL, logs, and timing info.
+Response includes the PR URL, logs, timing info, and cost metrics:
+
+```json
+{
+  "job_id": "550e8400-...",
+  "status": "completed",
+  "pr_url": "https://github.com/owner/repo/pull/42",
+  "total_cost": 0.0234,
+  "total_tokens_in": 125000,
+  "total_tokens_out": 8500,
+  "iterations": 2,
+  "tests_passed": true,
+  "debug_mode": false,
+  "resumed_from_checkpoint": false,
+  "exploration_report_generated": true,
+  "logs": ["..."]
+}
+```
+
+## Local Development
+
+### Running Locally
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd running-agent
+
+# Install Node.js dependencies
+npm install
+
+# TypeScript compilation check
+npx tsc --noEmit
+
+# Run the agent engine locally (needs env vars)
+GEMINI_API_KEY=... TASK_DESCRIPTION="..." WORKSPACE=/path/to/repo npm run dev
+```
+
+### Testing API Changes
+
+```bash
+# Deploy ephemeral version for testing
+modal serve api.py
+
+# Submit a test task
+curl -X POST http://localhost:.../submit \
+  -H "Content-Type: application/json" \
+  -d '{"repo_url": "https://github.com/you/test-repo.git", "task": "Add a hello world function"}'
+```
 
 ## Web Dashboard
 
@@ -154,7 +202,11 @@ running_agent/
 ├── models.py           # SQLite data models (jobs, pipelines, runs)
 ├── scheduler.py        # DAG scheduler + template resolution
 ├── src/
-│   └── index.ts        # Agent engine — OpenCode SDK + step context + structured output
+│   ├── index.ts        # Agent engine — OpenCode SDK + step context + structured output
+│   ├── verify.ts       # Project detection + test/build execution + error extraction
+│   ├── planner.ts      # Task decomposition prompts, plan parsing, diff formatting
+│   ├── repomap.ts      # Repository structure map generator with annotations
+│   └── context.ts      # Token estimation, context budgets, truncation, compaction
 ├── opencode.json       # LLM provider config (Gemini)
 ├── dashboard/          # React web UI
 │   └── src/App.jsx     # Dashboard app with WebSocket support
@@ -174,6 +226,39 @@ running_agent/
 **Phase 5 — Dashboard:** React frontend for visual task management with WebSocket live updates.
 
 **Phase 6 — Workflow Engine:** Multi-step pipelines with DAG scheduling, step-to-step context passing, template variables, and failure handling.
+
+**v0.7.1 — Reliability Improvements:** Critical bug fixes including proper resource cleanup (file descriptor leak fix), robust error handling (SDK operations wrapped in try-catch), accurate cost tracking (global state fix), and improved Python project detection.
+
+**v0.8 — Advanced Agent Behaviors:**
+- **Debug Agent Mode:** Detects repeated similar errors and switches to root-cause analysis mode
+- **Explore Agent Mode:** Pre-planning codebase exploration for better context understanding
+- **Session Persistence:** Checkpoint/resume capability for crash recovery
+
+## Key Features
+
+### Multi-Agent Architecture
+
+The system uses three specialized agents:
+
+| Agent | Model | Purpose |
+|-------|-------|---------|
+| `explore` | `gemini-2.5-pro` | Codebase exploration and understanding (read-only) |
+| `plan` | `gemini-2.5-pro` | Task decomposition and planning (read-only) |
+| `build` | `gemini-3-flash-preview` | Code execution and modifications (full access) |
+
+### Debug Mode
+
+When the agent encounters repeated similar errors (detected via Jaccard similarity on normalized error text), it automatically switches to a debug-focused approach:
+- Emphasizes root cause analysis over superficial fixes
+- Provides error history context for better diagnosis
+- Uses structured debugging methodology (Reproduce → Isolate → Hypothesize → Verify)
+
+### Session Persistence
+
+The agent saves checkpoints after each major phase (explore, plan, each verification iteration):
+- Enables crash recovery and session resumption
+- Preserves error history and debug mode state
+- Skips already-completed phases on resume
 
 ## Tech Stack
 

@@ -1,6 +1,6 @@
 # Running Agent — Development Plan & Technical Reference
 
-> Last updated: 2026-02-20 (v0.7)
+> Last updated: 2026-02-21 (v0.8)
 >
 > This document covers everything a new contributor needs to understand, extend, and deploy the Running Agent system. It is the single source of truth for project status, architecture, and roadmap.
 
@@ -54,11 +54,12 @@ Cloud Sandbox Container (sandbox_image)
 Agent Engine (src/index.ts)
   │  Phase 1: Boot OpenCode + configure agents
   │  Phase 2: Generate repo map + inject context
-  │  Phase 3: Plan agent decomposes task → subtasks
-  │  Phase 4: Build agent executes subtasks (SubtaskPartInput)
-  │  Phase 5: Verification loop (test/build, up to 5 iterations)
-  │  Phase 6: Context summarization (if session is long)
-  │  Phase 7: Final review → push → open PR
+  │  Phase 3: Explore phase (codebase understanding)
+  │  Phase 4: Plan agent decomposes task → subtasks
+  │  Phase 5: Build agent executes subtasks (SubtaskPartInput)
+  │  Phase 6: Verification loop (test/build, up to 5 iterations, with debug mode)
+  │  Phase 7: Context summarization (if session is long)
+  │  Phase 8: Final review → push → open PR
   ▼
 step_result.json (written to disk)
   │  Contains: pr_url, iterations, verification status,
@@ -72,14 +73,15 @@ GitHub Pull Request
 
 ### Multi-Agent Routing
 
-The OpenCode SDK is configured with two agents:
+The OpenCode SDK is configured with multiple agents:
 
 | Agent | Model | Role | Permissions |
 |-------|-------|------|-------------|
 | `plan` | `gemini-2.5-pro` | Read-only analysis and task decomposition | No file writes |
 | `build` | `gemini-3-flash-preview` | Full code editing, bash, git | Read + write + bash |
+| `explore` | `gemini-2.5-pro` | Codebase exploration and understanding | No file writes |
 
-The engine orchestrates these sequentially: plan first, then build.
+The engine orchestrates these sequentially: explore → plan → build.
 
 ### Pipeline Architecture
 
@@ -199,12 +201,55 @@ These phases enhanced the agent's intelligence and reliability:
 - `api.py` — `run_pipeline_step` mounts workspace volume, accepts `workspace_path` and `skip_clone` params, calls `workspace_volume.reload()` before and `workspace_volume.commit()` after. `_execute_pipeline_steps` uses shared workspace path `/workspaces/{run_id}`, first step clones, subsequent steps reuse.
 - `src/index.ts` — `WORKSPACE` is now configurable via `process.env.WORKSPACE`.
 
+#### Phase 5 (v0.8): Debug Agent + Explore Agent + Session Persistence
+
+**Goal:** Make the agent smarter with specialized behavior modes and crash recovery.
+
+**Changes across three sub-features:**
+
+##### 5a. Debug Agent Mode
+
+- `src/index.ts` — Error normalization (`normalizeError()`), Jaccard similarity calculation (`calculateJaccardSimilarity()`), repeated error detection (`isRepeatedError()`). When verification fails with a similar error to previous attempts (≥0.7 similarity), switch to debug mode.
+- `src/index.ts` — `DEBUG_SYSTEM_PROMPT` constant for debugging-focused system prompt. Uses `buildDebugPrompt()` to generate detailed feedback with error history context.
+- `shared.py` — `DEBUG_SYSTEM_PROMPT` and `EXPLORE_SYSTEM_PROMPT` constants for Python-side reference.
+
+**Logic flow:** After each verification failure, normalize the error and compare against history. If similarity threshold exceeded, activate debug mode. Subsequent prompts use debug system prompt emphasizing root cause analysis over superficial fixes.
+
+##### 5b. Explore Agent Mode
+
+- `src/index.ts` — `EXPLORE_SYSTEM_PROMPT` constant for exploration-focused system prompt. `buildExplorePrompt()` generates task-specific exploration prompts.
+- `src/index.ts` — Explore phase runs between repo map injection and planning. Produces an exploration report that's passed to the plan agent for better context.
+- Checkpoint tracks `completedPhases: ["explore", "plan", ...]` to avoid re-running on resume.
+
+**Logic flow:** After injecting repo map, prompt the explore agent to analyze codebase structure, identify key components, understand data flow. Report is included in planning context for better task decomposition.
+
+##### 5c. Session Persistence / Resume
+
+- `src/index.ts` — `Checkpoint` interface tracks: sessionId, task, workspace, attempt, debugMode, errorHistory, completedPhases, costTracking, explorationReport, plan.
+- `saveCheckpoint()`, `loadCheckpoint()`, `clearCheckpoint()` functions for checkpoint file management (`checkpoint.json` in workspace).
+- Main loop checks for existing checkpoint on startup. If found, resumes from saved state (skips completed phases, restores error history, continues from last attempt).
+- Checkpoint saved after: explore phase, plan phase, each verification iteration.
+- Checkpoint cleared on successful task completion.
+
+**Data flow:**
+
+```
+main() startup
+  → loadCheckpoint(workspace)
+  → if checkpoint exists:
+      → restore debugMode, errorHistory, completedPhases, explorationReport, plan
+      → startAttempt = checkpoint.attempt + 1
+  → run phases, skip if already completed
+  → saveCheckpoint() after each major phase
+  → on success: clearCheckpoint(workspace)
+```
+
 ---
 
-## 4. Current System Capabilities (v0.7)
+## 4. Current System Capabilities (v0.8)
 
 ### Standalone Task Execution
-- Accept task via HTTP → clone repo → generate repo map → plan subtasks → execute with build agent → verification loop → push + PR
+- Accept task via HTTP → clone repo → generate repo map → **explore codebase** → plan subtasks → execute with build agent → verification loop → push + PR
 - Automatic retry (3 attempts with exponential backoff)
 - Real-time WebSocket updates
 - Cost and token tracking per job
@@ -216,14 +261,17 @@ These phases enhanced the agent's intelligence and reliability:
 - Per-step failure handling: `stop` or `continue`
 
 ### Agent Intelligence
-- Two-agent architecture (plan + build) with different models
+- **Three-agent architecture** (explore + plan + build) with different models
 - Repo map for precise file navigation
 - Task decomposition for complex tasks
 - Verification inner loop (test/build, up to 5 iterations)
+- **Debug mode** activated on repeated similar errors (root cause analysis)
+- **Explore phase** for better codebase understanding before planning
+- **Session persistence** with checkpoint/resume for crash recovery
 - Smart context management (budget tracking, truncation, compaction, summarization)
 
 ### Observability
-- Structured step results: iterations, verification status, cost, tokens, subtask count
+- Structured step results: iterations, verification status, cost, tokens, subtask count, **debug mode status**, **checkpoint resume status**
 - Log accumulation across attempts
 - WebSocket streaming for real-time monitoring
 - Dashboard UI for visual management
@@ -236,7 +284,7 @@ These phases enhanced the agent's intelligence and reliability:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `src/index.ts` | 673 | Main orchestrator — lifecycle management, event handling, agent coordination |
+| `src/index.ts` | ~1000 | Main orchestrator — lifecycle management, event handling, agent coordination, debug mode, explore phase, checkpoint persistence |
 | `src/verify.ts` | 218 | Project detection + test/build execution + error extraction |
 | `src/repomap.ts` | 451 | Repository structure map generator with annotations and dependency graph |
 | `src/planner.ts` | 153 | Task decomposition prompts, plan parsing, diff formatting |
@@ -280,23 +328,33 @@ These phases enhanced the agent's intelligence and reliability:
    → run_agent(task)                  # → npm run dev → tsx src/index.ts
 
 4. src/index.ts [Agent Engine]
-   → createOpencode({ config: { model, compaction, agent: { plan, build } } })
+   → loadCheckpoint(WORKSPACE)  # Check for existing session to resume
+   → createOpencode({ config: { model, compaction, agent: { plan, build, explore } } })
    → session.create({ directory: WORKSPACE })
    → generateRepoMap(WORKSPACE, repoMapBudget())
    → session.prompt({ noReply: true, parts: [repoMap] })
-   → session.prompt({ agent: "plan", parts: [planningPrompt] })
+   → session.prompt({ agent: "plan", system: EXPLORE_SYSTEM_PROMPT, parts: [explorePrompt] })  # Explore phase
+   → saveCheckpoint({ ..., completedPhases: ["explore"], explorationReport })
+   → session.prompt({ agent: "plan", system: PLAN_SYSTEM_PROMPT, parts: [planningPrompt + explorationReport] })
    → parsePlan(response) → subtasks[]
-   → session.prompt({ agent: "build", parts: [subtaskParts] })
-   → for (i = 1..5) {
+   → saveCheckpoint({ ..., completedPhases: ["explore", "plan"], plan })
+   → session.prompt({ agent: "build", system: BUILD_SYSTEM_PROMPT, parts: [subtaskParts] })
+   → for (i = startAttempt..MAX_VERIFICATION_ATTEMPTS) {
        runVerification(WORKSPACE)
        if passed → break
-       session.prompt({ agent: "build", parts: [errorFeedback] })
+       if isRepeatedError(error, errorHistory):
+         debugMode = true  # Switch to debug mode
+       errorHistory.push({ normalizedError, attempt })
+       prompt = debugMode ? buildDebugPrompt(...) : buildVerificationFailedPrompt(...)
+       session.prompt({ agent: "build", system: debugMode ? DEBUG_SYSTEM_PROMPT : undefined, parts: [prompt] })
+       saveCheckpoint({ ..., attempt: i, debugMode, errorHistory })
      }
    → session.summarize() (if long session)
    → session.diff() → formatDiffSummary()
    → session.prompt({ agent: "build", parts: [finalReviewPrompt] })  # push + PR
    → session.messages() → extract PR URL
-   → fs.writeFileSync("step_result.json", { pr_url, iterations, cost, tokens, ... })
+   → fs.writeFileSync("step_result.json", { pr_url, iterations, cost, tokens, debug_mode, ... })
+   → clearCheckpoint(WORKSPACE)  # Clean up on success
 
 5. shared.py:run_agent()
    → reads step_result.json → returns { stdout, stderr, exit_code, pr_url, log_lines, step_output }
@@ -343,6 +401,21 @@ These phases enhanced the agent's intelligence and reliability:
 
 > Tracked in `.context/improvements.md`
 
+### Resolved (v0.7.1)
+
+| # | Issue | File(s) | Resolution |
+|---|-------|---------|------------|
+| - | **Global state not reset on retry**: `totalCost`, `totalTokensIn`, `totalTokensOut`, `totalCacheRead` were module-level globals, causing incorrect accumulation across retries. | `src/index.ts` | Introduced `CostTracker` interface, initialized inside `main()` for each invocation. |
+| - | **Logs lost on retry**: `all_logs` was re-initialized as empty on each retry attempt, losing previous logs. | `api.py` | Fetch existing logs from job record before starting new attempt. |
+| - | **PR URL extraction might find wrong URL**: Regex matched any GitHub PR URL in conversation history. | `src/index.ts` | Only extract PR URL from the last assistant message. |
+| - | **File descriptor leak**: `fs.openSync` without `try-finally` could leak FDs if `fs.readSync` threw. | `src/repomap.ts` | Added `finally` block to ensure `fs.closeSync` is always called. |
+| - | **Python test detection incomplete**: Only checked for `tests/` directory, missed `test_*.py` files. | `src/verify.ts` | Added `hasPythonTestFiles()` to recursively detect Python test files. |
+| - | **Template resolution for complex types**: Dicts/lists were converted to Python `str()` instead of JSON. | `scheduler.py` | Check `isinstance(value, (dict, list))` and use `json.dumps()`. |
+| - | **Plan Agent failure without warning**: Silent fallback to single-task mode when plan parsing failed. | `src/index.ts` | Added `log("ENGINE:WARN", ...)` for visibility. |
+| - | **SDK operations lack error handling**: Critical SDK calls could crash without writing `step_result.json`. | `src/index.ts` | Wrapped SDK calls in `try-catch`, added `fatalError` tracking. |
+| - | **Empty fields causes SQL error**: `update_job()` with empty `fields` dict generated invalid SQL. | `models.py` | Early return if `fields` is empty. |
+| - | **Pipeline workspace nonexistent**: `skip_clone=True` but workspace didn't exist caused unclear errors. | `api.py` | Added explicit check with clear `RuntimeError` message. |
+
 ### Open
 
 | # | Issue | File(s) | Priority |
@@ -359,57 +432,6 @@ These phases enhanced the agent's intelligence and reliability:
 ---
 
 ## 8. Future Roadmap
-
-### Phase 5 (v0.8): Advanced Agent Behaviors
-
-**Goal:** Make the agent smarter with specialized behavior modes and session persistence.
-
-#### 5a. Debug Agent Mode
-
-When the agent encounters persistent test failures (3+ verification iterations with same error pattern), switch to a dedicated debug agent that:
-- Analyzes the error pattern across iterations
-- Adds strategic `console.log`/`print` statements
-- Runs the failing test in isolation
-- Reads stack traces more carefully
-
-**Implementation guide:**
-1. In `src/index.ts`, after verification iteration 3, detect if error patterns repeat (simple string similarity on `errorSummary`).
-2. Add a `debug` agent config in `createOpencode({ config: { agent: { debug: { model: "gemini-2.5-pro" } } } })`.
-3. Create a debug-specific system prompt that focuses on root cause analysis rather than broad code changes.
-4. Switch to `agent: "debug"` for the fix prompt on iterations 4-5.
-
-**Files to modify:** `src/index.ts` (agent config + iteration logic)
-
-#### 5b. Explore Agent Mode
-
-For tasks that require understanding unfamiliar codebases (e.g., "find and fix all security vulnerabilities"), add an explore phase before planning:
-- Reads key files identified by the repo map
-- Summarizes the architecture
-- Identifies patterns and conventions
-
-**Implementation guide:**
-1. Detect "exploration-heavy" tasks in the planning prompt (or let the plan agent flag it).
-2. Add an `explore` agent config (read-only, like `plan`).
-3. Before the planning phase, run an explore session that reads entry points and key files, then produces a codebase summary.
-4. Include the summary in the planning prompt context.
-
-**Files to modify:** `src/index.ts` (new explore phase between repo map injection and planning)
-
-#### 5c. Session Persistence / Resume
-
-Currently, if a container crashes mid-execution, all progress is lost. Add session persistence:
-- Save session ID and accumulated state to `step_result.json` periodically
-- On restart, detect if a session exists and resume from the last checkpoint
-- Use `session.summarize()` before saving to keep the context compact
-
-**Implementation guide:**
-1. In `src/index.ts`, after each major phase (planning, subtask execution, each verification iteration), write a checkpoint to disk.
-2. On startup, check for an existing checkpoint. If found, load the session ID and skip completed phases.
-3. The SDK's `session.messages()` API can restore context.
-
-**Files to modify:** `src/index.ts` (checkpoint logic), `shared.py` (checkpoint file path alongside step_result.json)
-
----
 
 ### Phase 6 (v0.9): External Integration + Human-in-the-Loop
 
@@ -630,6 +652,7 @@ const { client, server } = await createOpencode({
     agent: {
       plan: { model: "google/gemini-2.5-pro" },
       build: { model: "google/gemini-3-flash-preview" },
+      explore: { model: "google/gemini-2.5-pro" },
     },
   },
 });
@@ -643,6 +666,16 @@ const { data: session } = await client.session.create({
 await client.session.prompt({
   path: { id: session.id },
   body: { noReply: true, parts: [{ type: "text", text: "..." }] },
+});
+
+// Explore phase (v0.8) - read-only codebase exploration
+await client.session.prompt({
+  path: { id: session.id },
+  body: {
+    agent: "plan",
+    system: EXPLORE_SYSTEM_PROMPT,
+    parts: [{ type: "text", text: buildExplorePrompt(task) }],
+  },
 });
 
 // Per-prompt agent and system override
@@ -670,6 +703,16 @@ await client.session.prompt({
   },
 });
 
+// Debug mode prompt (v0.8) - when repeated errors detected
+await client.session.prompt({
+  path: { id: session.id },
+  body: {
+    agent: "build",
+    system: DEBUG_SYSTEM_PROMPT,
+    parts: [{ type: "text", text: buildDebugPrompt(result, iteration, maxIter, errorHistory) }],
+  },
+});
+
 // Context compression
 await client.session.summarize({ sessionID: session.id, auto: true });
 
@@ -685,4 +728,21 @@ for await (const event of stream) {
   // event.type: "message.part.updated" | "session.status" | "session.idle" | "session.error" | "file.edited"
   // event.properties.part.type: "text" | "reasoning" | "tool" | "step-start" | "step-finish"
 }
+
+// Checkpoint persistence (v0.8)
+interface Checkpoint {
+  sessionId: string;
+  task: string;
+  workspace: string;
+  attempt: number;
+  debugMode: boolean;
+  errorHistory: ErrorSignature[];
+  completedPhases: string[];
+  costTracking: CostTracker;
+  explorationReport: string | null;
+  plan: TaskPlan | null;
+}
+// Save to workspace/checkpoint.json after each major phase
+// Load on startup to resume from crash
+// Clear on successful completion
 ```
