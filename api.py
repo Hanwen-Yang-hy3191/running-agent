@@ -28,7 +28,10 @@ import shutil
 import time
 import uuid
 
-from shared import sandbox_image, setup_github_auth, clone_and_install, run_agent
+from shared import (
+    sandbox_image, setup_github_auth, clone_and_install, run_agent,
+    workspace_volume, WORKSPACE_VOLUME_DIR,
+)
 from models import (
     db_volume, DB_DIR,
     create_job, get_job, update_job, list_jobs, now_iso,
@@ -63,7 +66,7 @@ api_image = (
 
 @app.function(
     image=sandbox_image,
-    timeout=1800,
+    timeout=3600,  # 60 min: enough for multi-subtask execution (agent timeout=3000s + buffer)
     volumes={DB_DIR: db_volume},
     secrets=[
         modal.Secret.from_name("gemini-key", required_keys=["GEMINI_API_KEY"]),
@@ -114,11 +117,27 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
             # Merge agent log lines into accumulated logs
             all_logs.extend(result["log_lines"])
 
+            # Extract metrics from step_output
+            step_out = result.get("step_output") or {}
+            iterations = step_out.get("iterations", 0)
+            verification_passed = step_out.get("verification_passed")
+            tests_passed = 1 if verification_passed else (0 if verification_passed is False else None)
+            subtasks_count = step_out.get("subtasks_count", 1)
+            agent_total_cost = step_out.get("total_cost", 0)
+            agent_tokens_in = step_out.get("total_tokens_in", 0)
+            agent_tokens_out = step_out.get("total_tokens_out", 0)
+
             update_job(
                 job_id,
                 status="completed",
                 completed_at=now_iso(),
                 attempt=attempt,
+                iterations=iterations,
+                tests_passed=tests_passed,
+                subtasks_count=subtasks_count,
+                total_cost=agent_total_cost,
+                total_tokens_in=agent_tokens_in,
+                total_tokens_out=agent_tokens_out,
                 result={
                     "pr_url": result["pr_url"],
                     "summary": (
@@ -127,6 +146,10 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
                         else "Agent finished (no PR URL detected)."
                     ),
                     "exit_code": result["exit_code"],
+                    "iterations": iterations,
+                    "verification_passed": verification_passed,
+                    "subtasks_count": subtasks_count,
+                    "total_cost": agent_total_cost,
                 },
                 logs=all_logs,
             )
@@ -172,8 +195,11 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
 
 @app.function(
     image=sandbox_image,
-    timeout=1800,
-    volumes={DB_DIR: db_volume},
+    timeout=3600,  # 60 min: enough for multi-subtask execution (agent timeout=3000s + buffer)
+    volumes={
+        DB_DIR: db_volume,
+        WORKSPACE_VOLUME_DIR: workspace_volume,
+    },
     secrets=[
         modal.Secret.from_name("gemini-key", required_keys=["GEMINI_API_KEY"]),
         modal.Secret.from_name("github-token", required_keys=["GITHUB_TOKEN"]),
@@ -185,15 +211,23 @@ def run_pipeline_step(
     task: str,
     step_context: dict,
     github_token: str = "",
+    workspace_path: str = "",
+    skip_clone: bool = False,
 ):
     """
     Execute a single pipeline step. Similar to run_agent_task but passes
     step_context to the agent for upstream output awareness.
+
+    When workspace_path is set and skip_clone=True, reuses the workspace
+    from a previous pipeline step (workspace persistence).
     """
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
     all_logs = []
+    workspace = workspace_path or WORKSPACE
 
     db_volume.reload()
+    if workspace_path:
+        workspace_volume.reload()
 
     job = get_job(job_id)
     if not job:
@@ -205,31 +239,48 @@ def run_pipeline_step(
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            if os.path.exists(WORKSPACE):
-                shutil.rmtree(WORKSPACE)
+            # Only clean up workspace if not using shared persistence
+            if not skip_clone and os.path.exists(workspace):
+                shutil.rmtree(workspace)
 
             msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Authenticating..."
             all_logs.append(msg)
             update_job(job_id, attempt=attempt, logs=all_logs)
             setup_github_auth(token)
 
-            msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Cloning..."
+            msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] {'Reusing workspace...' if skip_clone else 'Cloning...'}"
             all_logs.append(msg)
             update_job(job_id, logs=all_logs)
-            clone_and_install(repo_url)
+            clone_and_install(repo_url, workspace=workspace, skip_clone=skip_clone)
 
             msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Agent starting..."
             all_logs.append(msg)
             update_job(job_id, logs=all_logs)
-            result = run_agent(task, step_context=step_context)
+            result = run_agent(task, step_context=step_context, workspace=workspace)
 
             all_logs.extend(result["log_lines"])
+
+            # Extract metrics from step_output
+            step_out = result.get("step_output") or {}
+            iterations = step_out.get("iterations", 0)
+            verification_passed = step_out.get("verification_passed")
+            tests_passed = 1 if verification_passed else (0 if verification_passed is False else None)
+            subtasks_count = step_out.get("subtasks_count", 1)
+            agent_total_cost = step_out.get("total_cost", 0)
+            agent_tokens_in = step_out.get("total_tokens_in", 0)
+            agent_tokens_out = step_out.get("total_tokens_out", 0)
 
             update_job(
                 job_id,
                 status="completed",
                 completed_at=now_iso(),
                 attempt=attempt,
+                iterations=iterations,
+                tests_passed=tests_passed,
+                subtasks_count=subtasks_count,
+                total_cost=agent_total_cost,
+                total_tokens_in=agent_tokens_in,
+                total_tokens_out=agent_tokens_out,
                 result={
                     "pr_url": result["pr_url"],
                     "summary": (
@@ -238,12 +289,19 @@ def run_pipeline_step(
                         else "Step completed (no PR)."
                     ),
                     "exit_code": result["exit_code"],
+                    "iterations": iterations,
+                    "verification_passed": verification_passed,
+                    "subtasks_count": subtasks_count,
+                    "total_cost": agent_total_cost,
                 },
                 step_output=result["step_output"],
                 logs=all_logs,
             )
 
             db_volume.commit()
+            # Persist workspace for subsequent pipeline steps
+            if workspace_path:
+                workspace_volume.commit()
             return result["step_output"]
 
         except Exception as exc:
@@ -315,11 +373,18 @@ def _execute_pipeline_steps(
     steps: list,
     github_token: str,
 ):
-    """Inner pipeline execution logic, wrapped by run_pipeline_task for safety."""
+    """Inner pipeline execution logic, wrapped by run_pipeline_task for safety.
+
+    Uses a shared workspace on a Modal Volume so pipeline steps can build
+    on each other's changes without re-cloning the repository.
+    """
     update_pipeline_run(run_id, status="running", started_at=now_iso())
 
     step_map = {s["name"]: s for s in steps}
     layers = topological_sort(steps)
+
+    # Shared workspace path on the workspace volume for this run
+    run_workspace = f"{WORKSPACE_VOLUME_DIR}/{run_id}"
 
     # Create job records for each step
     job_ids: dict[str, str] = {}
@@ -341,6 +406,7 @@ def _execute_pipeline_steps(
     # Execute layer by layer
     step_outputs: dict[str, dict] = {}
     failed = False
+    is_first_step = True
 
     for layer in layers:
         if failed:
@@ -373,10 +439,13 @@ def _execute_pipeline_steps(
             on_failure = step_def.get("on_failure", "stop")
 
             try:
-                # Run the step synchronously (it's already in a Modal function)
+                # First step clones; subsequent steps reuse the workspace
                 step_result = run_pipeline_step.remote(
                     jid, repo_url, resolved_task, step_context, github_token,
+                    workspace_path=run_workspace,
+                    skip_clone=not is_first_step,
                 )
+                is_first_step = False
 
                 # Reload volume to see the step's DB writes
                 db_volume.reload()

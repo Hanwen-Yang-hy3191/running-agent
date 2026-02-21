@@ -44,6 +44,13 @@ sandbox_image = (
 
 STEP_RESULT_PATH = "/app/step_result.json"
 
+# ---------------------------------------------------------------------------
+# 1b. Workspace Volume — shared between pipeline steps
+# ---------------------------------------------------------------------------
+
+workspace_volume = modal.Volume.from_name("agent-workspaces", create_if_missing=True)
+WORKSPACE_VOLUME_DIR = "/workspaces"
+
 
 # ---------------------------------------------------------------------------
 # 2. GitHub + Git Authentication
@@ -83,10 +90,29 @@ def setup_github_auth(token: str) -> None:
 # 3. Clone + Install Dependencies
 # ---------------------------------------------------------------------------
 
-def clone_and_install(repo_url: str, workspace: str = "/app/workspace") -> None:
-    """Clone the target repository and install agent engine dependencies."""
-    print(f"[Cloud] Cloning {repo_url} ...")
-    subprocess.run(["git", "clone", repo_url, workspace], check=True)
+def clone_and_install(
+    repo_url: str,
+    workspace: str = "/app/workspace",
+    skip_clone: bool = False,
+) -> None:
+    """Clone the target repository and install agent engine dependencies.
+
+    When skip_clone=True (pipeline workspace persistence), the workspace
+    already exists from a previous step — skip cloning and reuse it.
+    """
+    if skip_clone and os.path.isdir(workspace):
+        print(f"[Cloud] Reusing existing workspace at {workspace} (skip_clone=True)")
+        # Fetch latest from remote so the agent sees any upstream changes
+        subprocess.run(
+            ["git", "fetch", "--all"],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+        )
+    else:
+        print(f"[Cloud] Cloning {repo_url} ...")
+        os.makedirs(os.path.dirname(workspace), exist_ok=True)
+        subprocess.run(["git", "clone", repo_url, workspace], check=True)
 
     os.chdir("/app")
     print("[Cloud] Installing Agent dependencies...")
@@ -108,21 +134,33 @@ def clone_and_install(repo_url: str, workspace: str = "/app/workspace") -> None:
 def run_agent(
     task: str,
     step_context: Optional[dict] = None,
-    timeout: int = 1500,
+    timeout: int = 3000,
+    workspace: str = "/app/workspace",
 ) -> dict:
     """
     Execute the Node.js agent engine and return structured results.
 
+    The agent runs a multi-phase pipeline:
+      Phase 1: Repo map generation + context injection
+      Phase 2: Task decomposition into subtasks (planner)
+      Phase 3: Execute each subtask through the verification inner loop
+      Final: Push + open PR
+
     Args:
         task: The task description for the agent.
         step_context: Optional dict with upstream step outputs (pipeline mode).
-        timeout: Max seconds to wait for the agent process.
+        timeout: Max seconds to wait (increased for multi-subtask execution).
+        workspace: Path to the repo workspace directory.
 
     Returns a dict with keys:
         stdout, stderr, exit_code, pr_url, log_lines, step_output.
+        step_output includes: iterations, verification_passed,
+        verification_command, project_type, subtasks_count, plan_reasoning,
+        total_cost, total_tokens_in, total_tokens_out.
     """
     env = os.environ.copy()
     env["TASK_DESCRIPTION"] = task
+    env["WORKSPACE"] = workspace
 
     if step_context:
         env["STEP_CONTEXT"] = json.dumps(step_context)
@@ -153,11 +191,11 @@ def run_agent(
                 pr_url = match.group(0)
                 break
 
-    # Last ~50 meaningful log lines
+    # Last ~150 meaningful log lines (increased for multi-subtask runs)
     log_lines = [
         l for l in combined.splitlines()
         if l.strip() and not l.startswith(">")
-    ][-50:]
+    ][-150:]
 
     # Read structured step output if the agent wrote one
     step_output = None
