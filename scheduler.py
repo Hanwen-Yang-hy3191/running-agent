@@ -8,6 +8,7 @@ pipeline DAG structure.
 The actual execution orchestration lives in api.py's run_pipeline_task.
 """
 
+import json
 import re
 from collections import deque
 
@@ -34,7 +35,12 @@ def resolve_templates(text: str, step_outputs: dict[str, dict]) -> str:
         key = match.group(2)
         output = step_outputs.get(step_name, {})
         value = output.get(key)
-        return str(value) if value is not None else match.group(0)
+        if value is None:
+            return match.group(0)
+        # Use JSON for complex types (dict/list) to ensure proper serialization
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return str(value)
 
     return _TEMPLATE_RE.sub(_replace, text)
 
