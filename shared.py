@@ -1,55 +1,26 @@
 """
 Shared infrastructure for the Background Coding Agent.
 
-Centralises the container image definition, GitHub/Git authentication,
-dependency installation, and agent execution logic so that both
-sandbox.py (CLI) and api.py (HTTP API) stay thin wrappers.
+Centralises GitHub/Git authentication, dependency installation,
+and agent execution logic so that both sandbox.py (CLI) and
+api.py (HTTP API) stay thin wrappers.
 """
 
 import json
-import modal
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# 1. Container Image
+# 1. Configurable Paths
 # ---------------------------------------------------------------------------
 
-sandbox_image = (
-    modal.Image.debian_slim()
-    .apt_install("git", "curl", "python3")
-    .pip_install("fastapi[standard]")
-    .run_commands(
-        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
-        "apt-get install -y nodejs",
-    )
-    .run_commands(
-        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-        "| dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg",
-        'echo "deb [arch=$(dpkg --print-architecture) '
-        "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
-        'https://cli.github.com/packages stable main" '
-        "| tee /etc/apt/sources.list.d/github-cli.list > /dev/null",
-        "apt-get update && apt-get install -y gh",
-    )
-    .env({"PYTHONPATH": "/app"})
-    .add_local_dir(
-        local_path=".",
-        remote_path="/app",
-        ignore=["dummy-workspace/**", "node_modules/**", "dashboard/**"],
-    )
-)
-
-STEP_RESULT_PATH = "/app/step_result.json"
-
-# ---------------------------------------------------------------------------
-# 1b. Workspace Volume — shared between pipeline steps
-# ---------------------------------------------------------------------------
-
-workspace_volume = modal.Volume.from_name("agent-workspaces", create_if_missing=True)
-WORKSPACE_VOLUME_DIR = "/workspaces"
+APP_DIR = os.environ.get("APP_DIR", str(Path(__file__).parent.resolve()))
+STEP_RESULT_PATH = os.path.join(APP_DIR, "step_result.json")
+WORKSPACES_DIR = os.environ.get("WORKSPACES_DIR", os.path.join(APP_DIR, "workspaces"))
+DEFAULT_WORKSPACE = os.path.join(APP_DIR, "workspace")
 
 
 # ---------------------------------------------------------------------------
@@ -99,16 +70,16 @@ Be thorough but focused on information relevant to the task."""
 def setup_github_auth(token: str) -> None:
     """Authenticate the GitHub CLI and configure Git credentials."""
     if not token:
-        print("[Cloud] WARNING: GITHUB_TOKEN is empty — PR creation will fail.")
+        print("[Agent] WARNING: GITHUB_TOKEN is empty — PR creation will fail.")
 
     proc = subprocess.run(
         ["gh", "auth", "login", "--with-token"],
         input=token, text=True, capture_output=True,
     )
     if proc.returncode != 0:
-        print(f"[Cloud] gh auth warning: {proc.stderr.strip()}")
+        print(f"[Agent] gh auth warning: {proc.stderr.strip()}")
     else:
-        print("[Cloud] gh auth OK")
+        print("[Agent] gh auth OK")
 
     subprocess.run(["gh", "auth", "status"], check=False)
 
@@ -132,7 +103,7 @@ def setup_github_auth(token: str) -> None:
 
 def clone_and_install(
     repo_url: str,
-    workspace: str = "/app/workspace",
+    workspace: str = "",
     skip_clone: bool = False,
 ) -> None:
     """Clone the target repository and install agent engine dependencies.
@@ -140,8 +111,10 @@ def clone_and_install(
     When skip_clone=True (pipeline workspace persistence), the workspace
     already exists from a previous step — skip cloning and reuse it.
     """
+    workspace = workspace or DEFAULT_WORKSPACE
+
     if skip_clone and os.path.isdir(workspace):
-        print(f"[Cloud] Reusing existing workspace at {workspace} (skip_clone=True)")
+        print(f"[Agent] Reusing existing workspace at {workspace} (skip_clone=True)")
         # Fetch latest from remote so the agent sees any upstream changes
         subprocess.run(
             ["git", "fetch", "--all"],
@@ -150,19 +123,20 @@ def clone_and_install(
             capture_output=True,
         )
     else:
-        print(f"[Cloud] Cloning {repo_url} ...")
+        print(f"[Agent] Cloning {repo_url} ...")
         os.makedirs(os.path.dirname(workspace), exist_ok=True)
         subprocess.run(["git", "clone", repo_url, workspace], check=True)
 
-    os.chdir("/app")
-    print("[Cloud] Installing Agent dependencies...")
-    subprocess.run(["npm", "install"], check=True)
-    subprocess.run(["npm", "install", "-g", "opencode-ai"], check=True)
+    os.chdir(APP_DIR)
+    print("[Agent] Installing Agent dependencies...")
+    subprocess.run(["npm", "install"], cwd=APP_DIR, check=True)
+    subprocess.run(["npm", "install", "-g", "opencode-ai"], cwd=APP_DIR, check=True)
 
-    os.makedirs("node_modules/@opencode-ai/sdk/dist", exist_ok=True)
+    sdk_dist = os.path.join(APP_DIR, "node_modules/@opencode-ai/sdk/dist")
+    os.makedirs(sdk_dist, exist_ok=True)
     try:
-        os.symlink("src/index.js", "node_modules/@opencode-ai/sdk/dist/index.js")
-        print("[Cloud] SDK symlink fix applied.")
+        os.symlink("src/index.js", os.path.join(sdk_dist, "index.js"))
+        print("[Agent] SDK symlink fix applied.")
     except FileExistsError:
         pass
 
@@ -175,7 +149,8 @@ def run_agent(
     task: str,
     step_context: Optional[dict] = None,
     timeout: int = 3000,
-    workspace: str = "/app/workspace",
+    workspace: str = "",
+    skip_pr: bool = False,
 ) -> dict:
     """
     Execute the Node.js agent engine and return structured results.
@@ -198,6 +173,8 @@ def run_agent(
         verification_command, project_type, subtasks_count, plan_reasoning,
         total_cost, total_tokens_in, total_tokens_out.
     """
+    workspace = workspace or DEFAULT_WORKSPACE
+
     env = os.environ.copy()
     env["TASK_DESCRIPTION"] = task
     env["WORKSPACE"] = workspace
@@ -205,13 +182,17 @@ def run_agent(
     if step_context:
         env["STEP_CONTEXT"] = json.dumps(step_context)
 
+    if skip_pr:
+        env["SKIP_PR"] = "true"
+
     # Clean up any previous step result
     if os.path.exists(STEP_RESULT_PATH):
         os.remove(STEP_RESULT_PATH)
 
-    print("[Cloud] Starting the Agent Engine...")
+    print("[Agent] Starting the Agent Engine...")
     result = subprocess.run(
         ["npm", "run", "dev"],
+        cwd=APP_DIR,
         env=env,
         capture_output=True,
         text=True,
@@ -243,9 +224,9 @@ def run_agent(
         try:
             with open(STEP_RESULT_PATH) as f:
                 step_output = json.load(f)
-            print(f"[Cloud] Step result read from {STEP_RESULT_PATH}")
+            print(f"[Agent] Step result read from {STEP_RESULT_PATH}")
         except (json.JSONDecodeError, OSError) as e:
-            print(f"[Cloud] Warning: could not read step result: {e}")
+            print(f"[Agent] Warning: could not read step result: {e}")
 
     # If no explicit step_output, build one from extracted data
     if step_output is None:

@@ -1,0 +1,11 @@
+node_modules/
+dashboard/node_modules/
+.git/
+data/
+workspaces/
+dummy-workspace/
+__pycache__/
+*.pyc
+.env
+.claude/
+docs/
