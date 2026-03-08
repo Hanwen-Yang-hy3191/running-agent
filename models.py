@@ -1,7 +1,7 @@
 """
 Data models and database access layer.
 
-Uses SQLite stored on a Modal Volume for persistence across deployments.
+Uses local SQLite for persistence. DB location is configurable via DATA_DIR env var.
 Supports jobs, pipelines, pipeline runs, and scheduled tasks.
 """
 
@@ -12,14 +12,11 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Optional
 
-import modal
-
 # ---------------------------------------------------------------------------
-# Modal Volume for persistent SQLite storage
+# Local SQLite storage (configurable via DATA_DIR env var)
 # ---------------------------------------------------------------------------
 
-db_volume = modal.Volume.from_name("agent-db", create_if_missing=True)
-DB_DIR = "/data"
+DB_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DB_DIR, "agent.db")
 
 
