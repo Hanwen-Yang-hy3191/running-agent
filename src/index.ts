@@ -669,19 +669,19 @@ async function main(): Promise<void> {
       hostname: "127.0.0.1",
       port: 0,
       config: {
-        model: "google/gemini-3-flash-preview",
+        model: "google/gemini-3.1-pro-preview",
         compaction,
         agent: {
           plan: {
-            model: "google/gemini-2.5-pro",
+            model: "google/gemini-3.1-pro-preview",
             // plan agent: read-only analysis, no file modification
           },
           build: {
-            model: "google/gemini-3-flash-preview",
+            model: "google/gemini-3.1-pro-preview",
             // build agent: full read/write/bash access (default permissions)
           },
           explore: {
-            model: "google/gemini-2.5-pro",
+            model: "google/gemini-3.1-flash-lite-preview",
             // explore agent: read-only codebase exploration (Phase 5)
           },
         },
@@ -1186,8 +1186,8 @@ async function main(): Promise<void> {
   console.log();
   log("ENGINE", "=".repeat(50));
   log("ENGINE", `Task complete.`);
-  log("ENGINE", `  Plan agent     : google/gemini-2.5-pro`);
-  log("ENGINE", `  Build agent    : google/gemini-3-flash-preview`);
+  log("ENGINE", `  Plan agent     : google/gemini-3.1-pro-preview`);
+  log("ENGINE", `  Build agent    : google/gemini-3.1-pro-preview`);
   log("ENGINE", `  Subtasks       : ${plan.subtasks.length}`);
   log("ENGINE", `  Iterations     : ${totalIterations}`);
   log("ENGINE", `  Verification   : ${allPassed ? "PASSED" : "FAILED/SKIPPED"}`);
