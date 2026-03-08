@@ -10,10 +10,10 @@ Inspired by the [Ramp background agent architecture](https://builders.ramp.com/p
 You (or any HTTP client)
   │  POST /submit { repo_url, task }
   ▼
-Modal Cloud API (api.py)
-  │  Spawns async agent task
+Docker Container (FastAPI + uvicorn)
+  │  Spawns subprocess for agent task
   ▼
-Cloud Sandbox (Node.js + OpenCode SDK)
+Agent Engine (Node.js + OpenCode SDK)
   │  Clones repo → Reads code → Writes changes
   │  Creates branch → Commits → Pushes → Opens PR
   ▼
@@ -21,7 +21,7 @@ GitHub Pull Request
 ```
 
 1. You submit a task via HTTP (or the web dashboard)
-2. The agent spins up in a Modal cloud sandbox with Node.js, Git, and GitHub CLI
+2. The agent runs inside a local Docker container with Node.js, Git, and GitHub CLI
 3. It uses the OpenCode SDK (powered by Gemini) to understand the codebase, write code, and run commands
 4. It creates a branch, commits changes, pushes, and opens a PR
 5. You poll for status or watch the dashboard — the PR URL appears when done
@@ -30,35 +30,29 @@ GitHub Pull Request
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) >= 20
-- [Modal](https://modal.com/) account and CLI (`pip install modal`)
+- [Docker](https://www.docker.com/) and Docker Compose
 - A [Gemini API key](https://ai.google.dev/)
 - A [GitHub personal access token](https://github.com/settings/tokens) with `repo` scope
 
-### 1. Store secrets in Modal (one-time setup)
+### Setup
 
 ```bash
-modal secret create gemini-key GEMINI_API_KEY=your_gemini_key
-modal secret create github-token GITHUB_TOKEN=your_github_token
-```
+# 1. Clone and configure
+git clone <repo-url>
+cd running-agent
+cp .env.example .env
+# Edit .env with your GEMINI_API_KEY and GITHUB_TOKEN
 
-### 2. Deploy the API
+# 2. Start everything
+docker compose up --build
 
-```bash
-modal deploy api.py
-```
+# 3. Open the dashboard
+open http://localhost:5173
 
-This gives you a permanent public URL like `https://your-name--agent-api-api.modal.run`.
-
-### 3. Submit a task
-
-```bash
-curl -X POST https://your-name--agent-api-api.modal.run/submit \
+# Or submit via curl
+curl -X POST http://localhost:8000/submit \
   -H "Content-Type: application/json" \
-  -d '{
-    "repo_url": "https://github.com/you/your-repo.git",
-    "task": "Add unit tests for the utils module"
-  }'
+  -d '{"repo_url": "https://github.com/you/your-repo.git", "task": "Add unit tests for the utils module"}'
 ```
 
 Response:
@@ -66,16 +60,16 @@ Response:
 { "job_id": "550e8400-...", "status": "queued" }
 ```
 
-### 4. Check status
+### Check status
 
 ```bash
-curl https://your-name--agent-api-api.modal.run/status/JOB_ID
+curl http://localhost:8000/status/JOB_ID
 ```
 
-### 5. Get the result
+### Get the result
 
 ```bash
-curl https://your-name--agent-api-api.modal.run/result/JOB_ID
+curl http://localhost:8000/result/JOB_ID
 ```
 
 Response includes the PR URL, logs, timing info, and cost metrics:
@@ -99,31 +93,34 @@ Response includes the PR URL, logs, timing info, and cost metrics:
 
 ## Local Development
 
-### Running Locally
+### Running with Docker
 
 ```bash
-# Clone the repository
+# Clone and configure
 git clone <repo-url>
 cd running-agent
+cp .env.example .env
+# Edit .env with your GEMINI_API_KEY and GITHUB_TOKEN
 
-# Install Node.js dependencies
-npm install
-
-# TypeScript compilation check
-npx tsc --noEmit
-
-# Run the agent engine locally (needs env vars)
-GEMINI_API_KEY=... TASK_DESCRIPTION="..." WORKSPACE=/path/to/repo npm run dev
+# Start everything
+docker compose up --build
 ```
 
-### Testing API Changes
+### Running without Docker
 
 ```bash
-# Deploy ephemeral version for testing
-modal serve api.py
+# Without Docker (needs Python 3.12+ and Node.js 20+)
+pip install -r requirements.txt
+npm install
+export GEMINI_API_KEY=... GITHUB_TOKEN=...
+python api.py  # Starts uvicorn on port 8000
+```
 
+### Testing
+
+```bash
 # Submit a test task
-curl -X POST http://localhost:.../submit \
+curl -X POST http://localhost:8000/submit \
   -H "Content-Type: application/json" \
   -d '{"repo_url": "https://github.com/you/test-repo.git", "task": "Add a hello world function"}'
 ```
@@ -197,7 +194,8 @@ Steps support `depends_on` for DAG ordering, `on_failure: "stop" | "continue"` f
 ```
 running_agent/
 ├── api.py              # HTTP API + pipeline endpoints + WebSocket
-├── sandbox.py          # CLI-triggered cloud execution
+├── Dockerfile          # Container image (Python 3.12 + Node.js 20 + git + gh)
+├── docker-compose.yml  # Single-command local deployment
 ├── shared.py           # Shared infrastructure (image, auth, agent runner)
 ├── models.py           # SQLite data models (jobs, pipelines, runs)
 ├── scheduler.py        # DAG scheduler + template resolution
@@ -234,6 +232,12 @@ running_agent/
 - **Explore Agent Mode:** Pre-planning codebase exploration for better context understanding
 - **Session Persistence:** Checkpoint/resume capability for crash recovery
 
+**v0.9 — Local Docker Execution:**
+- Replaced Modal cloud sandbox with local Docker container
+- Single container with Python 3.12 + Node.js 20 + git + gh
+- FastAPI API server with asyncio-based job execution
+- All existing features preserved (pipelines, WebSocket, dashboard)
+
 ## Key Features
 
 ### Multi-Agent Architecture
@@ -264,8 +268,8 @@ The agent saves checkpoints after each major phase (explore, plan, each verifica
 
 - **Agent Engine:** [OpenCode SDK](https://github.com/nichochar/opencode) + TypeScript
 - **LLM:** Google Gemini (via OpenCode)
-- **Cloud Sandbox:** [Modal](https://modal.com/) (serverless containers)
-- **API:** FastAPI on Modal
+- **Containers:** [Docker](https://www.docker.com/) (local containers)
+- **API:** FastAPI + uvicorn
 - **Frontend:** React + Vite
 - **VCS:** Git + GitHub CLI (`gh`)
 
