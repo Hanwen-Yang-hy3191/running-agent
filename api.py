@@ -80,7 +80,6 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
     Supports automatic retry with exponential backoff (up to MAX_ATTEMPTS).
     """
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
-    all_logs = []
 
     # Ensure we have the latest DB state (API container committed the job record)
     db_volume.reload()
@@ -88,6 +87,9 @@ def run_agent_task(job_id: str, repo_url: str, task: str, github_token: str = ""
     job = get_job(job_id)
     if not job:
         raise RuntimeError(f"Job {job_id} not found in database after reload — possible volume sync issue")
+
+    # Preserve existing logs from previous attempts (if any)
+    all_logs = job.get("logs") or []
 
     update_job(job_id, status="running", started_at=now_iso())
     db_volume.commit()
@@ -222,7 +224,6 @@ def run_pipeline_step(
     from a previous pipeline step (workspace persistence).
     """
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
-    all_logs = []
     workspace = workspace_path or WORKSPACE
 
     db_volume.reload()
@@ -233,6 +234,9 @@ def run_pipeline_step(
     if not job:
         raise RuntimeError(f"Pipeline step job {job_id} not found after reload")
 
+    # Preserve existing logs from previous attempts (if any)
+    all_logs = job.get("logs") or []
+
     update_job(job_id, status="running", started_at=now_iso())
     db_volume.commit()
 
@@ -242,6 +246,15 @@ def run_pipeline_step(
             # Only clean up workspace if not using shared persistence
             if not skip_clone and os.path.exists(workspace):
                 shutil.rmtree(workspace)
+
+            # Safety check: if skip_clone=True, verify workspace exists
+            if skip_clone and workspace_path:
+                if not os.path.exists(workspace):
+                    raise RuntimeError(
+                        f"Workspace '{workspace}' does not exist but skip_clone=True. "
+                        "This likely means a previous pipeline step failed. "
+                        "Cannot proceed without a valid workspace."
+                    )
 
             msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Authenticating..."
             all_logs.append(msg)

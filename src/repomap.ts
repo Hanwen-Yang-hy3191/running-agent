@@ -222,15 +222,19 @@ function extractSummary(filePath: string): string | null {
   if (!SOURCE_EXTS.has(ext)) return null;
 
   let content: string;
+  let fd: number | undefined;
   try {
     // Read only the first 2KB — enough for a leading comment
     const buf = Buffer.alloc(2048);
-    const fd = fs.openSync(filePath, "r");
+    fd = fs.openSync(filePath, "r");
     const bytesRead = fs.readSync(fd, buf, 0, 2048, 0);
-    fs.closeSync(fd);
     content = buf.toString("utf-8", 0, bytesRead);
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      fs.closeSync(fd);
+    }
   }
 
   const lines = content.split("\n").slice(0, 15);
@@ -304,14 +308,18 @@ function extractLocalImports(filePath: string): string[] {
   if (!SOURCE_EXTS.has(ext)) return [];
 
   let content: string;
+  let fd: number | undefined;
   try {
     const buf = Buffer.alloc(4096);
-    const fd = fs.openSync(filePath, "r");
+    fd = fs.openSync(filePath, "r");
     const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
-    fs.closeSync(fd);
     content = buf.toString("utf-8", 0, bytesRead);
   } catch {
     return [];
+  } finally {
+    if (fd !== undefined) {
+      fs.closeSync(fd);
+    }
   }
 
   const imports: string[] = [];
