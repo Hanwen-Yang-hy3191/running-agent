@@ -1,0 +1,23 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - ./data:/data
+      - ./workspaces:/workspaces
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/data
+      - WORKSPACES_DIR=/workspaces
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:${PORT:-8000}
+    depends_on:
+      - agent
