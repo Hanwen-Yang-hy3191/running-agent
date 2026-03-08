@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import "./App.css";
 
 // ── Configuration ────────────────────────────────────────────────────────────
-const API_BASE = "https://hanwen-yang-hy3191--agent-api-api.modal.run";
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const WS_BASE = API_BASE.replace(/^http/, "ws");
 const POLL_INTERVAL = 5000;
 
