@@ -6,3 +6,5 @@ dummy-workspace/*
 !dummy-workspace/.gitkeep
 PLAN.md
 .claude/
+data/
+workspaces/
