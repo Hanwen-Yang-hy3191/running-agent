@@ -215,15 +215,15 @@ running_agent/
 
 **Phase 1 — Local Engine:** OpenCode SDK provides the agent with file read/write and bash execution tools, powered by Gemini.
 
-**Phase 2 — Cloud Sandbox:** Modal runs the agent in an isolated container with Node.js, Python, Git, and GitHub CLI pre-installed.
+**Phase 2 — Docker Container:** Local Docker container with Node.js, Python, Git, and GitHub CLI pre-installed.
 
 **Phase 3 — Git PR Loop:** The agent creates branches, commits, pushes, and opens PRs autonomously via a structured system prompt.
 
-**Phase 4 — HTTP API:** Modal web endpoints expose an async job queue with WebSocket real-time updates, error retry (3 attempts with exponential backoff), and SQLite-backed persistent storage.
+**Phase 4 — HTTP API:** FastAPI endpoints expose an async job queue with WebSocket real-time updates, error retry (3 attempts with exponential backoff), and SQLite-backed persistent storage.
 
 **Phase 5 — Dashboard:** React frontend for visual task management with WebSocket live updates.
 
-**Phase 6 — Workflow Engine:** Multi-step pipelines with DAG scheduling, step-to-step context passing, template variables, and failure handling.
+**Phase 6 — Workflow Engine:** Multi-step pipelines with DAG scheduling, step-to-step context passing, template variables, and failure handling. Pipelines produce a single PR from the final step — intermediate steps work in a shared workspace without pushing.
 
 **v0.7.1 — Reliability Improvements:** Critical bug fixes including proper resource cleanup (file descriptor leak fix), robust error handling (SDK operations wrapped in try-catch), accurate cost tracking (global state fix), and improved Python project detection.
 
@@ -238,6 +238,13 @@ running_agent/
 - FastAPI API server with asyncio-based job execution
 - All existing features preserved (pipelines, WebSocket, dashboard)
 
+**v0.9.1 — Pipeline & Agent Fixes:**
+- Pipelines now produce a single PR (only the final step pushes; intermediate steps work locally)
+- Fixed workspace path permissions for pipeline steps (moved inside `/app` for OpenCode SDK compatibility)
+- Fixed explore agent to actually use `gemini-3.1-flash-lite-preview` (was incorrectly using the plan agent model)
+- Upgraded all models to Gemini 3.1 series (flash-lite for explore, pro for plan/build)
+- Fixed subtask working directory to ensure agent operates in the correct repo workspace
+
 ## Key Features
 
 ### Multi-Agent Architecture
@@ -246,9 +253,9 @@ The system uses three specialized agents:
 
 | Agent | Model | Purpose |
 |-------|-------|---------|
-| `explore` | `gemini-2.5-pro` | Codebase exploration and understanding (read-only) |
-| `plan` | `gemini-2.5-pro` | Task decomposition and planning (read-only) |
-| `build` | `gemini-3-flash-preview` | Code execution and modifications (full access) |
+| `explore` | `gemini-3.1-flash-lite-preview` | Codebase exploration and understanding (read-only) |
+| `plan` | `gemini-3.1-pro-preview` | Task decomposition and planning (read-only) |
+| `build` | `gemini-3.1-pro-preview` | Code execution and modifications (full access) |
 
 ### Debug Mode
 

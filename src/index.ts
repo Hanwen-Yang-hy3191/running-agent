@@ -34,6 +34,7 @@ const STEP_RESULT_PATH = "/app/step_result.json";
 const CHECKPOINT_FILE = "checkpoint.json";
 const MAX_ITERATIONS = 5;
 const MAX_VERIFICATION_ATTEMPTS = 5;
+const SKIP_PR = process.env.SKIP_PR === "true";
 
 const TASK_DESCRIPTION =
   process.env.TASK_DESCRIPTION ||
@@ -221,7 +222,7 @@ Your job is to complete tasks on a codebase. An automated verification system wi
 
 ## Environment
 - The repository has already been cloned to: ${WORKSPACE}
-- You are working inside that directory.
+- **IMPORTANT**: Always \`cd ${WORKSPACE}\` before running any commands. Your working directory may not default to the repository.
 - Git is configured with a valid identity (user.name / user.email).
 - The GitHub CLI (\`gh\`) is authenticated and ready to use.
 - You have full shell access via bash.
@@ -229,12 +230,13 @@ Your job is to complete tasks on a codebase. An automated verification system wi
 
 ## Workflow — follow these steps IN ORDER:
 
-1. **Understand the repo**: Review the repository map in context, then read the specific files relevant to your task.
-2. **Create a branch** (first subtask only): Run \`git checkout -b agent/<short-descriptive-name>\` from the default branch.
-3. **Do the work**: Write code, fix bugs, add features, write tests — whatever the task requires.
-4. **Self-verify**: If the project has tests or a build step, run them yourself first.
-5. **Commit**: Stage with \`git add -A\` and commit with a clear, conventional commit message.
-6. **STOP HERE** — do NOT push or open a PR. The engine handles that.
+1. **cd to repo**: Run \`cd ${WORKSPACE}\` first.
+2. **Understand the repo**: Review the repository map in context, then read the specific files relevant to your task.
+3. **Create a branch** (first subtask only): Run \`git checkout -b agent/<short-descriptive-name>\` from the default branch.
+4. **Do the work**: Write code, fix bugs, add features, write tests — whatever the task requires.
+5. **Self-verify**: If the project has tests or a build step, run them yourself first.
+6. **Commit**: Stage with \`git add -A\` and commit with a clear, conventional commit message.
+7. **STOP HERE** — do NOT push or open a PR. The engine handles that.
 
 ## Rules
 - NEVER push directly to main / master.
@@ -243,6 +245,7 @@ Your job is to complete tasks on a codebase. An automated verification system wi
 - If tests exist, make sure they pass before committing.
 - Debug errors and retry — do not give up easily.
 - Do NOT push to remote or open a PR until explicitly told to do so.
+- Always use absolute paths or cd to ${WORKSPACE} before file operations.
 `;
 
 /** System prompt for the explore agent (Phase 5: codebase exploration). */
@@ -346,11 +349,12 @@ ${status}
 ${diffSummary}
 
 ### Instructions
-1. Review the change summary above
-2. If you see any critical issues, fix and commit them now
-3. Push your branch: \`git push -u origin HEAD\`
-4. Open a PR: \`gh pr create --title "<concise title>" --body "<description of what you did and why${allPassed ? "" : ", including known remaining issues"}>"\`
-5. Output the PR URL as your final message
+1. First: \`cd ${WORKSPACE}\`
+2. Review the change summary above
+3. If you see any critical issues, fix and commit them now
+4. Push your branch: \`git push -u origin HEAD\`
+5. Open a PR: \`gh pr create --title "<concise title>" --body "<description of what you did and why${allPassed ? "" : ", including known remaining issues"}>"\`
+6. Output the PR URL as your final message
 `;
 }
 
@@ -812,7 +816,7 @@ async function main(): Promise<void> {
       const { data: exploreResponse } = await client.session.prompt({
         path: { id: session.id },
         body: {
-          agent: "plan", // Use plan agent config for exploration (read-only)
+          agent: "explore", // Use explore agent (gemini-3.1-flash-lite-preview)
           system: EXPLORE_SYSTEM_PROMPT,
           parts: [
             {
@@ -1073,39 +1077,43 @@ async function main(): Promise<void> {
   }
 
   // -- 10. Final review: session.diff() + push + PR ---------------------------
-  log("ENGINE", "=== Final Review (session.diff + push + PR) ===");
+  if (SKIP_PR) {
+    log("ENGINE", "=== Skipping Final Review (SKIP_PR=true, intermediate pipeline step) ===");
+  } else {
+    log("ENGINE", "=== Final Review (session.diff + push + PR) ===");
 
-  // Use session.diff() to get structured diff data from the SDK
-  let diffSummary = "";
-  try {
-    const { data: diffs } = await client.session.diff({
-      path: { id: session.id },
-    });
-    if (diffs) {
-      diffSummary = formatDiffSummary(diffs as FileDiff[]);
-      log("ENGINE", `session.diff(): ${(diffs as FileDiff[]).length} file(s) changed`);
+    // Use session.diff() to get structured diff data from the SDK
+    let diffSummary = "";
+    try {
+      const { data: diffs } = await client.session.diff({
+        path: { id: session.id },
+      });
+      if (diffs) {
+        diffSummary = formatDiffSummary(diffs as FileDiff[]);
+        log("ENGINE", `session.diff(): ${(diffs as FileDiff[]).length} file(s) changed`);
+      }
+    } catch (err) {
+      log("ENGINE:WARN", `session.diff() failed, falling back to prompt-based review: ${err}`);
+      diffSummary = "Could not retrieve diff summary. Run `git diff main..HEAD` to review your changes.";
     }
-  } catch (err) {
-    log("ENGINE:WARN", `session.diff() failed, falling back to prompt-based review: ${err}`);
-    diffSummary = "Could not retrieve diff summary. Run `git diff main..HEAD` to review your changes.";
-  }
 
-  try {
-    await client.session.prompt({
-      path: { id: session.id },
-      body: {
-        agent: "build",
-        parts: [
-          {
-            type: "text",
-            text: buildFinalReviewPrompt(diffSummary, allPassed),
-          },
-        ],
-      },
-    });
-    log("ENGINE", "Agent finished final review.");
-  } catch (err) {
-    log("ENGINE:WARN", `Final review prompt failed: ${err}. Continuing to extract results.`);
+    try {
+      await client.session.prompt({
+        path: { id: session.id },
+        body: {
+          agent: "build",
+          parts: [
+            {
+              type: "text",
+              text: buildFinalReviewPrompt(diffSummary, allPassed),
+            },
+          ],
+        },
+      });
+      log("ENGINE", "Agent finished final review.");
+    } catch (err) {
+      log("ENGINE:WARN", `Final review prompt failed: ${err}. Continuing to extract results.`);
+    }
   }
 
   // -- 11. Extract PR URL from the most recent assistant message ---------------
@@ -1186,6 +1194,7 @@ async function main(): Promise<void> {
   console.log();
   log("ENGINE", "=".repeat(50));
   log("ENGINE", `Task complete.`);
+  log("ENGINE", `  Explore agent  : google/gemini-3.1-flash-lite-preview`);
   log("ENGINE", `  Plan agent     : google/gemini-3.1-pro-preview`);
   log("ENGINE", `  Build agent    : google/gemini-3.1-pro-preview`);
   log("ENGINE", `  Subtasks       : ${plan.subtasks.length}`);

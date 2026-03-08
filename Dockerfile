@@ -46,14 +46,14 @@ COPY opencode.json ./
 COPY api.py shared.py models.py scheduler.py ./
 COPY src/ ./src/
 
-# Create directories for data and workspaces
-RUN mkdir -p /data /workspaces
+# Create directories for data and workspaces (workspaces inside /app for OpenCode permissions)
+RUN mkdir -p /data /app/workspaces
 
 # Environment defaults
 ENV PYTHONPATH=/app
 ENV APP_DIR=/app
 ENV DATA_DIR=/data
-ENV WORKSPACES_DIR=/workspaces
+ENV WORKSPACES_DIR=/app/workspaces
 ENV PORT=8000
 
 EXPOSE 8000

@@ -176,6 +176,7 @@ def _run_pipeline_step_sync(
     github_token: str = "",
     workspace_path: str = "",
     skip_clone: bool = False,
+    skip_pr: bool = False,
 ):
     """
     Execute a single pipeline step. Similar to _run_agent_task_sync but passes
@@ -225,7 +226,7 @@ def _run_pipeline_step_sync(
             msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Agent starting..."
             all_logs.append(msg)
             update_job(job_id, logs=all_logs)
-            result = run_agent(task, step_context=step_context, workspace=workspace)
+            result = run_agent(task, step_context=step_context, workspace=workspace, skip_pr=skip_pr)
 
             all_logs.extend(result["log_lines"])
 
@@ -370,6 +371,9 @@ def _execute_pipeline_steps(
         )
         job_ids[step["name"]] = job_id
 
+    # Determine which steps are in the final layer (only they push + PR)
+    final_layer_steps = set(layers[-1]) if layers else set()
+
     # Execute layer by layer
     step_outputs: dict[str, dict] = {}
     failed = False
@@ -406,10 +410,13 @@ def _execute_pipeline_steps(
 
             try:
                 # First step clones; subsequent steps reuse the workspace
+                # Only the final layer creates a PR; intermediate steps skip push+PR
+                is_final_step = step_name in final_layer_steps
                 step_result = _run_pipeline_step_sync(
                     jid, repo_url, resolved_task, step_context, github_token,
                     workspace_path=run_workspace,
                     skip_clone=not is_first_step,
+                    skip_pr=not is_final_step,
                 )
                 is_first_step = False
 

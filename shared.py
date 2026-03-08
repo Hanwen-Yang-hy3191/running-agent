@@ -19,7 +19,7 @@ from typing import Optional
 
 APP_DIR = os.environ.get("APP_DIR", str(Path(__file__).parent.resolve()))
 STEP_RESULT_PATH = os.path.join(APP_DIR, "step_result.json")
-WORKSPACES_DIR = os.environ.get("WORKSPACES_DIR", "/workspaces")
+WORKSPACES_DIR = os.environ.get("WORKSPACES_DIR", os.path.join(APP_DIR, "workspaces"))
 DEFAULT_WORKSPACE = os.path.join(APP_DIR, "workspace")
 
 
@@ -150,6 +150,7 @@ def run_agent(
     step_context: Optional[dict] = None,
     timeout: int = 3000,
     workspace: str = "",
+    skip_pr: bool = False,
 ) -> dict:
     """
     Execute the Node.js agent engine and return structured results.
@@ -180,6 +181,9 @@ def run_agent(
 
     if step_context:
         env["STEP_CONTEXT"] = json.dumps(step_context)
+
+    if skip_pr:
+        env["SKIP_PR"] = "true"
 
     # Clean up any previous step result
     if os.path.exists(STEP_RESULT_PATH):

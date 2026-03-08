@@ -5,12 +5,12 @@ services:
       - "${PORT:-8000}:8000"
     volumes:
       - ./data:/data
-      - ./workspaces:/workspaces
+      - ./workspaces:/app/workspaces
     env_file:
       - .env
     environment:
       - DATA_DIR=/data
-      - WORKSPACES_DIR=/workspaces
+      - WORKSPACES_DIR=/app/workspaces
     restart: unless-stopped
 
   dashboard:
