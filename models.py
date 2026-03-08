@@ -106,9 +106,31 @@ CREATE TABLE IF NOT EXISTS schedules (
 # ---------------------------------------------------------------------------
 
 def _init_db(conn: sqlite3.Connection) -> None:
-    """Create tables and indexes if they don't exist."""
+    """Create tables and indexes if they don't exist, then run migrations."""
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced in later phases (idempotent)."""
+    # Phase 1 (v0.4): inner-loop tracking columns on jobs table
+    _add_column(conn, "jobs", "iterations", "INTEGER DEFAULT 0")
+    _add_column(conn, "jobs", "tests_passed", "INTEGER")
+    # Phase 3 (v0.6): task decomposition tracking
+    _add_column(conn, "jobs", "subtasks_count", "INTEGER DEFAULT 1")
+    # Phase 4 (v0.7): cost and token tracking
+    _add_column(conn, "jobs", "total_cost", "REAL DEFAULT 0")
+    _add_column(conn, "jobs", "total_tokens_in", "INTEGER DEFAULT 0")
+    _add_column(conn, "jobs", "total_tokens_out", "INTEGER DEFAULT 0")
+
+
+def _add_column(conn: sqlite3.Connection, table: str, column: str, typedef: str) -> None:
+    """Add a column if it does not already exist (SQLite has no IF NOT EXISTS for ALTER)."""
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cursor.fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typedef}")
 
 
 @contextmanager
@@ -197,6 +219,10 @@ def update_job(job_id: str, **fields) -> Optional[dict]:
         fields["step_output_json"] = json.dumps(fields.pop("step_output"))
 
     fields["updated_at"] = now_iso()
+
+    # Guard against empty fields to prevent invalid SQL
+    if not fields:
+        return get_job(job_id)
 
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [job_id]
