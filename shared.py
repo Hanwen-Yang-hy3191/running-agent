@@ -151,6 +151,7 @@ def run_agent(
     timeout: int = 3000,
     workspace: str = "",
     skip_pr: bool = False,
+    require_human_review: bool = False,
 ) -> dict:
     """
     Execute the Node.js agent engine and return structured results.
@@ -184,6 +185,9 @@ def run_agent(
 
     if skip_pr:
         env["SKIP_PR"] = "true"
+
+    if require_human_review:
+        env["REQUIRE_HUMAN_REVIEW"] = "true"
 
     # Clean up any previous step result
     if os.path.exists(STEP_RESULT_PATH):

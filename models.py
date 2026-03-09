@@ -120,6 +120,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _add_column(conn, "jobs", "total_cost", "REAL DEFAULT 0")
     _add_column(conn, "jobs", "total_tokens_in", "INTEGER DEFAULT 0")
     _add_column(conn, "jobs", "total_tokens_out", "INTEGER DEFAULT 0")
+    # v1.0: Review Agent columns
+    _add_column(conn, "jobs", "review_verdict", "TEXT")
+    _add_column(conn, "jobs", "review_confidence", "REAL")
+    _add_column(conn, "jobs", "review_summary", "TEXT")
+    _add_column(conn, "jobs", "review_issues_count", "INTEGER")
+    _add_column(conn, "jobs", "pr_is_draft", "INTEGER")
 
 
 def _add_column(conn: sqlite3.Connection, table: str, column: str, typedef: str) -> None:
