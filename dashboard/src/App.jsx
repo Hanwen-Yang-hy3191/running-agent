@@ -32,6 +32,28 @@ function Badge({ status }) {
   );
 }
 
+// ── Review verdict badge ─────────────────────────────────────────────────────
+function ReviewBadge({ verdict, confidence }) {
+  if (!verdict) return null;
+  const styles = {
+    approve: { bg: "#dcfce7", color: "#166534", label: "Approved" },
+    request_changes: { bg: "#fef3c7", color: "#92400e", label: "Changes Requested" },
+    flag_for_human: { bg: "#fce7f3", color: "#9d174d", label: "Needs Review" },
+  };
+  const style = styles[verdict] || styles.flag_for_human;
+  return (
+    <span style={{
+      padding: "2px 8px",
+      borderRadius: "4px",
+      fontSize: "0.8em",
+      backgroundColor: style.bg,
+      color: style.color,
+    }}>
+      {style.label} ({(confidence * 100).toFixed(0)}%)
+    </span>
+  );
+}
+
 // ── Time helpers ─────────────────────────────────────────────────────────────
 function timeAgo(iso) {
   if (!iso) return "";
@@ -366,6 +388,27 @@ export default function App() {
               </div>
             </div>
 
+            {/* Review Agent Verdict */}
+            {selected.review_verdict && (
+              <div style={{ marginTop: "12px", padding: "12px", border: "1px solid #e5e7eb", borderRadius: "8px" }}>
+                <h4 style={{ margin: "0 0 8px 0" }}>Review Agent</h4>
+                <ReviewBadge verdict={selected.review_verdict} confidence={selected.review_confidence} />
+                {selected.review_summary && (
+                  <p style={{ margin: "8px 0 0 0", fontSize: "0.9em", color: "#374151" }}>{selected.review_summary}</p>
+                )}
+                {selected.review_issues_count > 0 && (
+                  <p style={{ margin: "4px 0 0 0", fontSize: "0.85em", color: "#6b7280" }}>
+                    {selected.review_issues_count} issue(s) found
+                  </p>
+                )}
+                {selected.pr_is_draft === 1 && (
+                  <p style={{ margin: "4px 0 0 0", fontSize: "0.85em", color: "#92400e" }}>
+                    PR created as Draft — human review required
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* Agent Logs */}
             {wsLogs.length > 0 && (
               <div className="logs-section">
@@ -402,6 +445,7 @@ function JobItem({ job, isActive, onClick }) {
     >
       <div className="job-item-top">
         <Badge status={job.status} />
+        <ReviewBadge verdict={job.review_verdict} confidence={job.review_confidence} />
         <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
           {timeAgo(job.submitted_at)}
         </span>
