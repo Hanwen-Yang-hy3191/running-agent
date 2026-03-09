@@ -258,6 +258,29 @@ def get_jobs_for_run(run_id: str) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def get_job_stats() -> dict:
+    """Get aggregate statistics about jobs for the health endpoint."""
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) as running,
+                SUM(CASE WHEN review_verdict='approve' AND (pr_is_draft IS NULL OR pr_is_draft=0) THEN 1 ELSE 0 END) as auto_approved,
+                SUM(CASE WHEN pr_is_draft=1 THEN 1 ELSE 0 END) as human_review
+            FROM jobs
+        """).fetchone()
+        return {
+            "total": row[0] or 0,
+            "completed": row[1] or 0,
+            "failed": row[2] or 0,
+            "running": row[3] or 0,
+            "auto_approved": row[4] or 0,
+            "human_review": row[5] or 0,
+        }
+
+
 def cleanup_old_jobs(days: int = 30) -> int:
     """Delete completed/failed jobs older than `days`. Returns count deleted."""
     with get_db() as conn:

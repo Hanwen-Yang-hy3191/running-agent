@@ -7,7 +7,7 @@ import pytest
 _test_dir = tempfile.mkdtemp()
 os.environ["DATA_DIR"] = _test_dir
 
-from models import create_job, get_job, update_job, get_db
+from models import create_job, get_job, update_job, get_db, get_job_stats
 
 
 def test_job_has_review_columns():
@@ -37,3 +37,15 @@ def test_update_job_with_review_data():
     assert job["review_verdict"] == "approve"
     assert job["review_confidence"] == 0.92
     assert job["pr_is_draft"] == 0  # SQLite stores as int
+
+
+def test_get_job_stats():
+    """Job stats should include all required fields."""
+    stats = get_job_stats()
+    assert "total" in stats
+    assert "completed" in stats
+    assert "failed" in stats
+    assert "running" in stats
+    assert "auto_approved" in stats
+    assert "human_review" in stats
+    assert all(isinstance(v, int) for v in stats.values())

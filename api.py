@@ -26,6 +26,7 @@ import os
 import shutil
 import time
 import uuid
+from datetime import datetime
 
 from shared import (
     setup_github_auth, clone_and_install, run_agent,
@@ -496,7 +497,14 @@ app.add_middleware(
 
 @app.get("/health")
 def ep_health():
-    return {"status": "ok", "timestamp": now_iso()}
+    from models import get_job_stats
+    stats = get_job_stats()
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "stats": stats,
+    }
 
 
 @app.post("/submit")
