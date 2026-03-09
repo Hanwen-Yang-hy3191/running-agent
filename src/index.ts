@@ -690,16 +690,20 @@ async function main(): Promise<void> {
         compaction,
         agent: {
           plan: {
-            model: "google/gemini-3.1-pro-preview",
-            // plan agent: read-only analysis, no file modification
+            model: "google/gemini-3.1-flash-preview",
+            // plan agent: task decomposition, flash is sufficient
           },
           build: {
             model: "google/gemini-3.1-pro-preview",
-            // build agent: full read/write/bash access (default permissions)
+            // build agent: code generation, needs strongest model
           },
           explore: {
             model: "google/gemini-3.1-flash-lite-preview",
-            // explore agent: read-only codebase exploration (Phase 5)
+            // explore agent: read-only codebase exploration
+          },
+          review: {
+            model: "google/gemini-3.1-pro-preview",
+            // review agent (门下省): independent code review, needs strong reasoning
           },
         },
       },
@@ -1146,7 +1150,7 @@ async function main(): Promise<void> {
         const reviewResponse = await client.session.prompt({
           path: { id: session.id },
           body: {
-            agent: "explore",
+            agent: "review", // Uses gemini-3.1-pro for high-quality code review
             system:
               "You are an independent code reviewer. Review the provided changes and return ONLY a JSON verdict. Do not modify any files.",
             parts: [{ type: "text" as const, text: reviewPromptText }],
@@ -1408,8 +1412,9 @@ async function main(): Promise<void> {
   log("ENGINE", "=".repeat(50));
   log("ENGINE", `Task complete.`);
   log("ENGINE", `  Explore agent  : google/gemini-3.1-flash-lite-preview`);
-  log("ENGINE", `  Plan agent     : google/gemini-3.1-pro-preview`);
+  log("ENGINE", `  Plan agent     : google/gemini-3.1-flash-preview`);
   log("ENGINE", `  Build agent    : google/gemini-3.1-pro-preview`);
+  log("ENGINE", `  Review agent   : google/gemini-3.1-pro-preview`);
   log("ENGINE", `  Subtasks       : ${plan.subtasks.length}`);
   log("ENGINE", `  Iterations     : ${totalIterations}`);
   log("ENGINE", `  Verification   : ${allPassed ? "PASSED" : "FAILED/SKIPPED"}`);
