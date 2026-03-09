@@ -261,6 +261,107 @@ function runCommand(
  * Run verification on the workspace. Tries test command first, falls back
  * to build command. Returns null if no verification is possible.
  */
+export interface ExtendedCheck {
+  name: string;
+  command: string;
+  required: boolean; // if false, failure is warning only
+}
+
+/**
+ * Detect additional quality checks beyond test/build.
+ */
+export function detectExtendedChecks(
+  workspace: string,
+  projectType: string
+): ExtendedCheck[] {
+  const checks: ExtendedCheck[] = [];
+
+  if (projectType === "node") {
+    // Check for ESLint config
+    const eslintConfigs = [
+      ".eslintrc.js", ".eslintrc.json", ".eslintrc.yml",
+      ".eslintrc.cjs", "eslint.config.js", "eslint.config.mjs",
+    ];
+    const hasEslint = eslintConfigs.some((f) =>
+      fs.existsSync(path.join(workspace, f))
+    );
+    if (hasEslint) {
+      checks.push({
+        name: "lint",
+        command: "npx eslint . --max-warnings 0",
+        required: false,
+      });
+    }
+
+    // Check for TypeScript
+    if (fs.existsSync(path.join(workspace, "tsconfig.json"))) {
+      checks.push({
+        name: "typecheck",
+        command: "npx tsc --noEmit",
+        required: false,
+      });
+    }
+  }
+
+  if (projectType === "python") {
+    // Check for ruff
+    if (
+      fs.existsSync(path.join(workspace, "ruff.toml")) ||
+      fs.existsSync(path.join(workspace, "pyproject.toml"))
+    ) {
+      checks.push({
+        name: "lint",
+        command: "python -m ruff check .",
+        required: false,
+      });
+    }
+
+    // Check for mypy
+    if (fs.existsSync(path.join(workspace, "mypy.ini")) ||
+        fs.existsSync(path.join(workspace, "pyproject.toml"))) {
+      checks.push({
+        name: "typecheck",
+        command: "python -m mypy . --ignore-missing-imports",
+        required: false,
+      });
+    }
+  }
+
+  return checks;
+}
+
+/**
+ * Run all extended checks, return results.
+ */
+export function runExtendedChecks(
+  workspace: string,
+  projectType: string
+): { name: string; passed: boolean; output: string }[] {
+  const checks = detectExtendedChecks(workspace, projectType);
+  const results: { name: string; passed: boolean; output: string }[] = [];
+
+  for (const check of checks) {
+    try {
+      const output = execSync(check.command, {
+        cwd: workspace,
+        timeout: 60_000,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      results.push({ name: check.name, passed: true, output: output ?? "" });
+    } catch (err: any) {
+      const output = (err.stdout ?? "") + "\n" + (err.stderr ?? "");
+      results.push({ name: check.name, passed: false, output: output.trim() });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Run verification on the workspace. Tries test command first, falls back
+ * to build command. Returns null if no verification is possible.
+ */
 export function runVerification(workspace: string): VerificationResult | null {
   const detection = detectProject(workspace);
   if (!detection) {

@@ -2,13 +2,14 @@ import { createOpencode } from "@opencode-ai/sdk";
 import type { Event as SdkEvent } from "@opencode-ai/sdk";
 import fs from "node:fs";
 import path from "node:path";
-import { runVerification, type VerificationResult } from "./verify.js";
+import { runVerification, runExtendedChecks, type VerificationResult } from "./verify.js";
 import { generateRepoMap } from "./repomap.js";
 import {
   buildPlanningPrompt,
   parsePlan,
   extractTextFromParts,
   formatDiffSummary,
+  validatePlan,
   type TaskPlan,
   type FileDiff,
 } from "./planner.js";
@@ -905,6 +906,16 @@ async function main(): Promise<void> {
       for (const st of plan.subtasks) {
         log("ENGINE", `  - [${st.name}] ${st.task.slice(0, 100)}`);
       }
+
+      // Validate the plan
+      const validation = validatePlan(plan);
+      for (const w of validation.warnings) log("PLAN", `\u26a0 ${w}`);
+      if (!validation.valid) {
+        log("PLAN", `\u274c Plan validation failed: ${validation.errors.join("; ")}`);
+        // Continue anyway — the plan may still partially work
+      } else {
+        log("PLAN", "\u2705 Plan validation passed");
+      }
     } else {
       // Fallback: treat the entire task as a single subtask
       log(
@@ -1071,6 +1082,14 @@ async function main(): Promise<void> {
       log("ENGINE", `Build agent finished fix attempt ${i}.`);
     } catch (err) {
       log("ENGINE:WARN", `Verification feedback prompt failed: ${err}. Continuing with current state.`);
+    }
+  }
+
+  // Run extended checks (lint, typecheck) — informational only
+  if (lastVerification) {
+    const extResults = runExtendedChecks(WORKSPACE, lastVerification.projectType);
+    for (const ext of extResults) {
+      log("VERIFY", `Extended check [${ext.name}]: ${ext.passed ? "PASS" : `WARN — ${ext.output.slice(0, 200)}`}`);
     }
   }
 
