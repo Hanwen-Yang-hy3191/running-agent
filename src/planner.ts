@@ -130,6 +130,78 @@ export function extractTextFromParts(parts: unknown[]): string {
  * Format an array of FileDiff objects (from session.diff()) into a
  * human-readable summary for the final review prompt.
  */
+// ---------------------------------------------------------------------------
+// Plan validation
+// ---------------------------------------------------------------------------
+
+export interface PlanValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+const MAX_SUBTASKS = 6;
+const MIN_TASK_DESCRIPTION_LENGTH = 15;
+const VAGUE_PATTERNS = /^(fix|update|change|modify|do|handle|add|improve)\s+(the\s+)?(code|stuff|things?|it)$/i;
+
+export function validatePlan(plan: {
+  reasoning: string;
+  subtasks: { name: string; task: string }[];
+}): PlanValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // Check empty subtasks
+  if (!plan.subtasks || plan.subtasks.length === 0) {
+    errors.push("Plan has no subtasks");
+    return { valid: false, errors, warnings };
+  }
+
+  // Check too many subtasks
+  if (plan.subtasks.length > MAX_SUBTASKS) {
+    errors.push(
+      `Plan has too many subtasks (${plan.subtasks.length} > ${MAX_SUBTASKS}). Break into a pipeline instead.`
+    );
+  }
+
+  // Check duplicate names
+  const names = plan.subtasks.map((s) => s.name);
+  const uniqueNames = new Set(names);
+  if (uniqueNames.size !== names.length) {
+    errors.push("Plan has duplicate subtask names");
+  }
+
+  // Check each subtask
+  for (const subtask of plan.subtasks) {
+    if (!subtask.task || subtask.task.length < MIN_TASK_DESCRIPTION_LENGTH) {
+      warnings.push(
+        `Subtask "${subtask.name}" has a very short description (${subtask.task?.length ?? 0} chars). May be too vague.`
+      );
+    }
+
+    if (VAGUE_PATTERNS.test(subtask.task?.trim() ?? "")) {
+      warnings.push(
+        `Subtask "${subtask.name}" has a vague description: "${subtask.task}". Consider being more specific.`
+      );
+    }
+  }
+
+  // Check reasoning
+  if (!plan.reasoning || plan.reasoning.length < 10) {
+    warnings.push("Plan reasoning is very short. Consider explaining the approach.");
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Diff formatting
+// ---------------------------------------------------------------------------
+
 export function formatDiffSummary(diffs: FileDiff[]): string {
   if (!diffs || diffs.length === 0) {
     return "No file changes detected.";
