@@ -283,3 +283,5 @@ The agent saves checkpoints after each major phase (explore, plan, each verifica
 ## License
 
 MIT
+
+SDK Fixed! Testing now.
