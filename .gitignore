@@ -2,6 +2,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
+__pycache__/
+*.pyc
 dummy-workspace/*
 !dummy-workspace/.gitkeep
 PLAN.md

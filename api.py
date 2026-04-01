@@ -26,6 +26,7 @@ import os
 import shutil
 import time
 import uuid
+from datetime import datetime
 
 from shared import (
     setup_github_auth, clone_and_install, run_agent,
@@ -48,7 +49,7 @@ RETRY_BASE_DELAY = 10  # seconds, exponential: 10, 20, 40
 # 1. Synchronous task runners (executed via asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
-def _run_agent_task_sync(job_id: str, repo_url: str, task: str, github_token: str = ""):
+def _run_agent_task_sync(job_id: str, repo_url: str, task: str, github_token: str = "", require_human_review: bool = False):
     """
     The heavy lifter -- runs the agent synchronously.
     Uses shared.py for auth, clone, install, and agent execution.
@@ -85,7 +86,7 @@ def _run_agent_task_sync(job_id: str, repo_url: str, task: str, github_token: st
             msg = f"[Attempt {attempt}/{MAX_ATTEMPTS}] Agent engine starting..."
             all_logs.append(msg)
             update_job(job_id, logs=all_logs)
-            result = run_agent(task)
+            result = run_agent(task, require_human_review=require_human_review)
 
             # Merge agent log lines into accumulated logs
             all_logs.extend(result["log_lines"])
@@ -100,8 +101,15 @@ def _run_agent_task_sync(job_id: str, repo_url: str, task: str, github_token: st
             agent_tokens_in = step_out.get("total_tokens_in", 0)
             agent_tokens_out = step_out.get("total_tokens_out", 0)
 
-            update_job(
-                job_id,
+            # Store review data from step_output
+            review_data = {}
+            if step_out:
+                for field in ["review_verdict", "review_confidence", "review_summary",
+                               "review_issues_count", "pr_is_draft"]:
+                    if field in step_out:
+                        review_data[field] = step_out[field]
+
+            update_kwargs = dict(
                 status="completed",
                 completed_at=now_iso(),
                 attempt=attempt,
@@ -126,6 +134,10 @@ def _run_agent_task_sync(job_id: str, repo_url: str, task: str, github_token: st
                 },
                 logs=all_logs,
             )
+            if review_data:
+                update_kwargs.update(review_data)
+
+            update_job(job_id, **update_kwargs)
 
             return {"status": "completed", "pr_url": result["pr_url"]}
 
@@ -159,9 +171,9 @@ def _run_agent_task_sync(job_id: str, repo_url: str, task: str, github_token: st
                 raise last_error
 
 
-async def _run_agent_task_async(job_id: str, repo_url: str, task: str, github_token: str = ""):
+async def _run_agent_task_async(job_id: str, repo_url: str, task: str, github_token: str = "", require_human_review: bool = False):
     """Async wrapper: runs the sync agent task in a thread pool."""
-    await asyncio.to_thread(_run_agent_task_sync, job_id, repo_url, task, github_token)
+    await asyncio.to_thread(_run_agent_task_sync, job_id, repo_url, task, github_token, require_human_review)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +189,7 @@ def _run_pipeline_step_sync(
     workspace_path: str = "",
     skip_clone: bool = False,
     skip_pr: bool = False,
+    require_human_review: bool = False,
 ):
     """
     Execute a single pipeline step. Similar to _run_agent_task_sync but passes
@@ -226,7 +239,7 @@ def _run_pipeline_step_sync(
             msg = f"[Step:{step_context.get('step_name', '?')}][Attempt {attempt}/{MAX_ATTEMPTS}] Agent starting..."
             all_logs.append(msg)
             update_job(job_id, logs=all_logs)
-            result = run_agent(task, step_context=step_context, workspace=workspace, skip_pr=skip_pr)
+            result = run_agent(task, step_context=step_context, workspace=workspace, skip_pr=skip_pr, require_human_review=require_human_review)
 
             all_logs.extend(result["log_lines"])
 
@@ -240,8 +253,15 @@ def _run_pipeline_step_sync(
             agent_tokens_in = step_out.get("total_tokens_in", 0)
             agent_tokens_out = step_out.get("total_tokens_out", 0)
 
-            update_job(
-                job_id,
+            # Store review data from step_output
+            review_data = {}
+            if step_out:
+                for field in ["review_verdict", "review_confidence", "review_summary",
+                               "review_issues_count", "pr_is_draft"]:
+                    if field in step_out:
+                        review_data[field] = step_out[field]
+
+            update_kwargs = dict(
                 status="completed",
                 completed_at=now_iso(),
                 attempt=attempt,
@@ -267,6 +287,10 @@ def _run_pipeline_step_sync(
                 step_output=result["step_output"],
                 logs=all_logs,
             )
+            if review_data:
+                update_kwargs.update(review_data)
+
+            update_job(job_id, **update_kwargs)
 
             return result["step_output"]
 
@@ -412,11 +436,13 @@ def _execute_pipeline_steps(
                 # First step clones; subsequent steps reuse the workspace
                 # Only the final layer creates a PR; intermediate steps skip push+PR
                 is_final_step = step_name in final_layer_steps
+                step_require_human_review = step_def.get("require_human_review", False)
                 step_result = _run_pipeline_step_sync(
                     jid, repo_url, resolved_task, step_context, github_token,
                     workspace_path=run_workspace,
                     skip_clone=not is_first_step,
                     skip_pr=not is_final_step,
+                    require_human_review=step_require_human_review,
                 )
                 is_first_step = False
 
@@ -471,7 +497,14 @@ app.add_middleware(
 
 @app.get("/health")
 def ep_health():
-    return {"status": "ok", "timestamp": now_iso()}
+    from models import get_job_stats
+    stats = get_job_stats()
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "stats": stats,
+    }
 
 
 @app.post("/submit")
@@ -488,12 +521,13 @@ async def ep_submit(request: Request):
 
     github_token = body.get("github_token", "")
     user_id = body.get("user_id", "anonymous")
+    require_human_review = body.get("require_human_review", False)
 
     job_id = str(uuid.uuid4())
     record = create_job(job_id, repo_url, task, user_id)
 
     # Fire and forget -- the task runs in the background
-    asyncio.create_task(_run_agent_task_async(job_id, repo_url, task, github_token))
+    asyncio.create_task(_run_agent_task_async(job_id, repo_url, task, github_token, require_human_review))
 
     return {
         "job_id": job_id,

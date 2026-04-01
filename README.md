@@ -14,17 +14,17 @@ Docker Container (FastAPI + uvicorn)
   │  Spawns subprocess for agent task
   ▼
 Agent Engine (Node.js + OpenCode SDK)
-  │  Clones repo → Reads code → Writes changes
-  │  Creates branch → Commits → Pushes → Opens PR
+  │  Explore → Plan → [Plan Validation] → Build → Verify → [Extended Checks] → Review Agent → Push + PR
   ▼
-GitHub Pull Request
+GitHub Pull Request (with quality report)
 ```
 
 1. You submit a task via HTTP (or the web dashboard)
 2. The agent runs inside a local Docker container with Node.js, Git, and GitHub CLI
 3. It uses the OpenCode SDK (powered by Gemini) to understand the codebase, write code, and run commands
-4. It creates a branch, commits changes, pushes, and opens a PR
-5. You poll for status or watch the dashboard — the PR URL appears when done
+4. Quality gates validate the plan, run extended lint/typecheck verification, and an independent Review Agent evaluates the diff
+5. It creates a branch, commits changes, pushes, and opens a PR with an automated quality report
+6. You poll for status or watch the dashboard — the PR URL appears when done
 
 ## Quick Start
 
@@ -119,7 +119,16 @@ python api.py  # Starts uvicorn on port 8000
 ### Testing
 
 ```bash
-# Submit a test task
+# Unit tests
+python -m pytest tests/ -v
+
+# Integration tests (requires running Docker environment)
+docker compose exec agent python -m pytest tests/test_integration.py -v
+
+# Or run integration tests locally
+RUN_INTEGRATION_TESTS=1 python -m pytest tests/test_integration.py -v
+
+# Submit a test task via curl
 curl -X POST http://localhost:8000/submit \
   -H "Content-Type: application/json" \
   -d '{"repo_url": "https://github.com/you/test-repo.git", "task": "Add a hello world function"}'
@@ -147,7 +156,7 @@ Open `http://localhost:5173` — you can submit tasks, watch status updates, vie
 | `GET` | `/status/{job_id}` | Check task status |
 | `GET` | `/result/{job_id}` | Get full result (PR URL, logs, error) |
 | `GET` | `/jobs` | List all tasks |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check (includes version + job stats) |
 | `WS` | `/ws/{job_id}` | WebSocket real-time job updates |
 
 ### Pipelines
@@ -169,9 +178,18 @@ Open `http://localhost:5173` — you can submit tasks, watch status updates, vie
   "repo_url": "https://github.com/owner/repo.git",
   "task": "What the agent should do",
   "github_token": "optional — overrides server default",
-  "user_id": "optional — for audit tracking"
+  "user_id": "optional — for audit tracking",
+  "require_human_review": false
 }
 ```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `repo_url` | string | **required** | GitHub repository URL |
+| `task` | string | **required** | Description of what the agent should do |
+| `github_token` | string | env default | Override the server's GitHub token |
+| `user_id` | string | `null` | For audit tracking |
+| `require_human_review` | bool | `false` | When `true`, forces the PR to be created as a draft regardless of the review verdict |
 
 ### POST /pipelines
 
@@ -203,8 +221,10 @@ running_agent/
 │   ├── index.ts        # Agent engine — OpenCode SDK + step context + structured output
 │   ├── verify.ts       # Project detection + test/build execution + error extraction
 │   ├── planner.ts      # Task decomposition prompts, plan parsing, diff formatting
+│   ├── review.ts       # Review Agent — LLM-based code review and quality verdicts
 │   ├── repomap.ts      # Repository structure map generator with annotations
 │   └── context.ts      # Token estimation, context budgets, truncation, compaction
+├── tests/              # Python test suite (unit + integration scaffolding)
 ├── opencode.json       # LLM provider config (Gemini)
 ├── dashboard/          # React web UI
 │   └── src/App.jsx     # Dashboard app with WebSocket support
@@ -245,17 +265,28 @@ running_agent/
 - Upgraded all models to Gemini 3.1 series (flash-lite for explore, pro for plan/build)
 - Fixed subtask working directory to ensure agent operates in the correct repo workspace
 
+**v1.0 — Production Quality Gates:**
+- **Review Agent (門下省):** Automated LLM-based code review before PR creation. Uses an independent explore agent to review diffs against the original task. Produces a structured verdict (`approve` / `request_changes` / `flag_for_human`) with a confidence score. Auto-approved PRs are merged-ready; low-confidence results are opened as drafts.
+- **Extended Verification:** Lint and typecheck detection and execution. Automatically discovers and runs project linters (ESLint, ruff) and type checkers (TypeScript `tsc`, mypy) in addition to existing test/build verification.
+- **Plan Validation:** Automatic validation of subtask plans for structural issues such as too many subtasks, duplicate steps, and vague descriptions, before the build phase begins.
+- **PR Quality Metadata:** Every PR body now includes an automated quality report table with the review verdict, confidence score, files changed, test status, iteration count, and cost.
+- **`require_human_review` Parameter:** New API parameter on `POST /submit` to force draft PRs for mandatory human review, regardless of the review agent's verdict.
+- **Dashboard Review Verdicts:** Visual review badges in the job list and detail views showing the review outcome at a glance.
+- **Health Stats:** The `/health` endpoint now returns job statistics (queued, running, completed, failed counts) and the API version (`1.0.0`).
+- **Integration Test Scaffolding:** Pytest-based integration tests that run inside the Docker environment.
+
 ## Key Features
 
 ### Multi-Agent Architecture
 
-The system uses three specialized agents:
+The system uses four specialized agents:
 
 | Agent | Model | Purpose |
 |-------|-------|---------|
 | `explore` | `gemini-3.1-flash-lite-preview` | Codebase exploration and understanding (read-only) |
 | `plan` | `gemini-3.1-pro-preview` | Task decomposition and planning (read-only) |
 | `build` | `gemini-3.1-pro-preview` | Code execution and modifications (full access) |
+| `review` | `gemini-3.1-flash-lite-preview` | Independent code review and quality verdict (read-only) |
 
 ### Debug Mode
 
@@ -279,6 +310,37 @@ The agent saves checkpoints after each major phase (explore, plan, each verifica
 - **API:** FastAPI + uvicorn
 - **Frontend:** React + Vite
 - **VCS:** Git + GitHub CLI (`gh`)
+
+## Changelog
+
+### v1.0.0 — Production Quality Gates
+
+- Added Review Agent (門下省) for automated LLM-based code review with structured verdicts
+- Added extended verification with lint and typecheck detection (ESLint, TypeScript, ruff, mypy)
+- Added plan validation to catch structural issues before the build phase
+- Added PR quality metadata (review verdict, confidence, metrics) to PR bodies
+- Added `require_human_review` API parameter for mandatory draft PRs
+- Added review verdict badges to the dashboard job list and detail views
+- Enhanced `/health` endpoint with job statistics and version info
+- Added integration test scaffolding for Docker-based testing
+
+### v0.9.1 — Pipeline & Agent Fixes
+
+- Fixed single-PR output for pipelines
+- Fixed workspace permissions for pipeline steps
+- Fixed explore agent model selection
+- Upgraded to Gemini 3.1 models
+
+### v0.9.0 — Local Docker Execution
+
+- Replaced Modal cloud sandbox with local Docker container
+- FastAPI API server with asyncio-based job execution
+
+### v0.8.0 — Advanced Agent Behaviors
+
+- Debug agent mode for repeated error detection
+- Explore agent mode for pre-planning codebase analysis
+- Session persistence with checkpoint/resume
 
 ## License
 

@@ -2,13 +2,14 @@ import { createOpencode } from "@opencode-ai/sdk";
 import type { Event as SdkEvent } from "@opencode-ai/sdk";
 import fs from "node:fs";
 import path from "node:path";
-import { runVerification, type VerificationResult } from "./verify.js";
+import { runVerification, runExtendedChecks, type VerificationResult } from "./verify.js";
 import { generateRepoMap } from "./repomap.js";
 import {
   buildPlanningPrompt,
   parsePlan,
   extractTextFromParts,
   formatDiffSummary,
+  validatePlan,
   type TaskPlan,
   type FileDiff,
 } from "./planner.js";
@@ -18,6 +19,16 @@ import {
   repoMapBudget,
   buildCompactionConfig,
 } from "./context.js";
+import {
+  parseReviewVerdict,
+  shouldAutoApprove,
+  shouldRequestChanges,
+  buildReviewPrompt,
+  buildReviewFixPrompt,
+  formatReviewForPR,
+  type ReviewVerdict,
+  type PRMetrics,
+} from "./review.js";
 
 // Re-alias the SDK's Event union so we can reference it concisely.
 type AgentEvent = SdkEvent;
@@ -35,6 +46,8 @@ const CHECKPOINT_FILE = "checkpoint.json";
 const MAX_ITERATIONS = 5;
 const MAX_VERIFICATION_ATTEMPTS = 5;
 const SKIP_PR = process.env.SKIP_PR === "true";
+const MAX_REVIEW_ITERATIONS = 2;
+const REQUIRE_HUMAN_REVIEW = process.env.REQUIRE_HUMAN_REVIEW === "true";
 
 const TASK_DESCRIPTION =
   process.env.TASK_DESCRIPTION ||
@@ -677,16 +690,20 @@ async function main(): Promise<void> {
         compaction,
         agent: {
           plan: {
-            model: "google/gemini-3.1-pro-preview",
-            // plan agent: read-only analysis, no file modification
+            model: "google/gemini-3.1-flash-preview",
+            // plan agent: task decomposition, flash is sufficient
           },
           build: {
             model: "google/gemini-3.1-pro-preview",
-            // build agent: full read/write/bash access (default permissions)
+            // build agent: code generation, needs strongest model
           },
           explore: {
             model: "google/gemini-3.1-flash-lite-preview",
-            // explore agent: read-only codebase exploration (Phase 5)
+            // explore agent: read-only codebase exploration
+          },
+          review: {
+            model: "google/gemini-3.1-pro-preview",
+            // review agent (门下省): independent code review, needs strong reasoning
           },
         },
       },
@@ -893,6 +910,16 @@ async function main(): Promise<void> {
       for (const st of plan.subtasks) {
         log("ENGINE", `  - [${st.name}] ${st.task.slice(0, 100)}`);
       }
+
+      // Validate the plan
+      const validation = validatePlan(plan);
+      for (const w of validation.warnings) log("PLAN", `\u26a0 ${w}`);
+      if (!validation.valid) {
+        log("PLAN", `\u274c Plan validation failed: ${validation.errors.join("; ")}`);
+        // Continue anyway — the plan may still partially work
+      } else {
+        log("PLAN", "\u2705 Plan validation passed");
+      }
     } else {
       // Fallback: treat the entire task as a single subtask
       log(
@@ -1062,6 +1089,14 @@ async function main(): Promise<void> {
     }
   }
 
+  // Run extended checks (lint, typecheck) — informational only
+  if (lastVerification) {
+    const extResults = runExtendedChecks(WORKSPACE, lastVerification.projectType);
+    for (const ext of extResults) {
+      log("VERIFY", `Extended check [${ext.name}]: ${ext.passed ? "PASS" : `WARN — ${ext.output.slice(0, 200)}`}`);
+    }
+  }
+
   // -- 9. Summarize session if it's been long (context compression) ----------
   if (totalIterations >= 2 || plan.subtasks.length >= 3) {
     log("ENGINE", "Session has been long — triggering context summarization...");
@@ -1076,25 +1111,196 @@ async function main(): Promise<void> {
     }
   }
 
-  // -- 10. Final review: session.diff() + push + PR ---------------------------
+  // -- 9.5. REVIEW AGENT PHASE (门下省) ----------------------------------------
+  let reviewVerdict: ReviewVerdict | null = null;
+  let reviewIteration = 0;
+
+  if (!SKIP_PR) {
+    log("ENGINE", "=== Review Agent Phase (门下省) ===");
+
+    // Get the current diff for review
+    let reviewDiffSummary = "";
+    try {
+      const { data: reviewDiffs } = await client.session.diff({
+        path: { id: session.id },
+      });
+      if (reviewDiffs) {
+        reviewDiffSummary = formatDiffSummary(reviewDiffs as FileDiff[]);
+      }
+    } catch (err) {
+      log("ENGINE:WARN", `session.diff() for review failed: ${err}`);
+    }
+
+    for (
+      reviewIteration = 1;
+      reviewIteration <= MAX_REVIEW_ITERATIONS;
+      reviewIteration++
+    ) {
+      log("REVIEW", `Review iteration ${reviewIteration}/${MAX_REVIEW_ITERATIONS}`);
+
+      // Send review prompt to explore agent (independent, read-only context)
+      const reviewPromptText = buildReviewPrompt(
+        TASK_DESCRIPTION,
+        reviewDiffSummary,
+        allPassed,
+        explorationReport ?? ""
+      );
+
+      try {
+        const reviewResponse = await client.session.prompt({
+          path: { id: session.id },
+          body: {
+            agent: "review", // Uses gemini-3.1-pro for high-quality code review
+            system:
+              "You are an independent code reviewer. Review the provided changes and return ONLY a JSON verdict. Do not modify any files.",
+            parts: [{ type: "text" as const, text: reviewPromptText }],
+          },
+        });
+
+        // Parse the response
+        const reviewText = extractTextFromParts(
+          (reviewResponse.data as any)?.parts ?? []
+        );
+        reviewVerdict = parseReviewVerdict(reviewText);
+
+        if (!reviewVerdict) {
+          log("REVIEW", "WARNING: Could not parse review verdict, defaulting to flag_for_human");
+          reviewVerdict = {
+            verdict: "flag_for_human",
+            confidence: 0.0,
+            issues: [],
+            summary: "Review agent produced unparseable output.",
+          };
+          break;
+        }
+
+        log("REVIEW", `Verdict: ${reviewVerdict.verdict} (confidence: ${reviewVerdict.confidence})`);
+        log("REVIEW", `Issues: ${reviewVerdict.issues.length} found`);
+        log("REVIEW", `Summary: ${reviewVerdict.summary}`);
+
+        if (shouldAutoApprove(reviewVerdict)) {
+          log("REVIEW", "Auto-approved by Review Agent");
+          break;
+        }
+
+        if (
+          shouldRequestChanges(reviewVerdict) &&
+          reviewIteration < MAX_REVIEW_ITERATIONS
+        ) {
+          log("REVIEW", "Requesting changes from Build Agent...");
+          const fixPrompt = buildReviewFixPrompt(
+            reviewVerdict,
+            reviewIteration,
+            MAX_REVIEW_ITERATIONS
+          );
+          await client.session.prompt({
+            path: { id: session.id },
+            body: {
+              agent: "build",
+              system: debugMode ? DEBUG_SYSTEM_PROMPT : BUILD_SYSTEM_PROMPT,
+              parts: [{ type: "text" as const, text: fixPrompt }],
+            },
+          });
+
+          // Re-verify after fixes
+          log("REVIEW", "Re-running verification after review fixes...");
+          const reVerify = runVerification(WORKSPACE);
+          if (reVerify) {
+            allPassed = reVerify.passed;
+            log("REVIEW", `Re-verification: ${allPassed ? "PASSED" : "FAILED"}`);
+          }
+
+          // Re-fetch diff for next review iteration
+          try {
+            const { data: newDiffs } = await client.session.diff({
+              path: { id: session.id },
+            });
+            if (newDiffs) {
+              reviewDiffSummary = formatDiffSummary(newDiffs as FileDiff[]);
+            }
+          } catch (err) {
+            log("REVIEW:WARN", `Failed to refresh diff: ${err}`);
+          }
+          continue;
+        }
+
+        // flag_for_human or low-confidence approve — stop reviewing
+        break;
+      } catch (err) {
+        log("REVIEW:WARN", `Review agent prompt failed: ${err}`);
+        reviewVerdict = {
+          verdict: "flag_for_human",
+          confidence: 0.0,
+          issues: [],
+          summary: `Review agent error: ${err}`,
+        };
+        break;
+      }
+    }
+  }
+
+  // -- 10. Final review: push + PR (with review metadata) ----------------------
   if (SKIP_PR) {
     log("ENGINE", "=== Skipping Final Review (SKIP_PR=true, intermediate pipeline step) ===");
   } else {
-    log("ENGINE", "=== Final Review (session.diff + push + PR) ===");
+    log("ENGINE", "=== Final Review (push + PR) ===");
 
-    // Use session.diff() to get structured diff data from the SDK
+    // Get diff for PR metrics
+    let diffData: FileDiff[] = [];
     let diffSummary = "";
     try {
       const { data: diffs } = await client.session.diff({
         path: { id: session.id },
       });
       if (diffs) {
-        diffSummary = formatDiffSummary(diffs as FileDiff[]);
-        log("ENGINE", `session.diff(): ${(diffs as FileDiff[]).length} file(s) changed`);
+        diffData = diffs as FileDiff[];
+        diffSummary = formatDiffSummary(diffData);
+        log("ENGINE", `session.diff(): ${diffData.length} file(s) changed`);
       }
     } catch (err) {
-      log("ENGINE:WARN", `session.diff() failed, falling back to prompt-based review: ${err}`);
-      diffSummary = "Could not retrieve diff summary. Run `git diff main..HEAD` to review your changes.";
+      log("ENGINE:WARN", `session.diff() failed: ${err}`);
+      diffSummary = "Could not retrieve diff summary.";
+    }
+
+    // Calculate PR metrics
+    const prMetrics: PRMetrics = {
+      filesChanged: diffData.length,
+      linesAdded: diffData.reduce(
+        (sum: number, d: any) => sum + (d.additions ?? 0),
+        0
+      ),
+      linesRemoved: diffData.reduce(
+        (sum: number, d: any) => sum + (d.deletions ?? 0),
+        0
+      ),
+      testsPassed: allPassed,
+      iterations: totalIterations,
+      totalCost: costTracker.totalCost,
+    };
+
+    // Determine if PR should be draft
+    const isDraft =
+      REQUIRE_HUMAN_REVIEW ||
+      (reviewVerdict !== null && !shouldAutoApprove(reviewVerdict));
+
+    // Build PR body with review metadata
+    const reviewSection = reviewVerdict
+      ? formatReviewForPR(reviewVerdict, prMetrics)
+      : "";
+
+    const prTypeNote = isDraft
+      ? "Create a DRAFT pull request (use `gh pr create --draft` flag) because this requires human review."
+      : "Create a regular pull request.";
+
+    const prBodyInstructions = reviewSection
+      ? `\n\nInclude the following at the END of the PR description body:\n\n${reviewSection}`
+      : "";
+
+    const finalPrompt = `${buildFinalReviewPrompt(diffSummary, allPassed)}\n\n## Additional PR Instructions\n${prTypeNote}${prBodyInstructions}`;
+
+    log("ENGINE", `PR type: ${isDraft ? "DRAFT" : "REGULAR"}`);
+    if (reviewVerdict) {
+      log("ENGINE", `Review verdict: ${reviewVerdict.verdict} (confidence: ${reviewVerdict.confidence})`);
     }
 
     try {
@@ -1105,7 +1311,7 @@ async function main(): Promise<void> {
           parts: [
             {
               type: "text",
-              text: buildFinalReviewPrompt(diffSummary, allPassed),
+              text: finalPrompt,
             },
           ],
         },
@@ -1181,6 +1387,17 @@ async function main(): Promise<void> {
     error_history_count: errorHistory.length,
     resumed_from_checkpoint: existingCheckpoint !== null,
     exploration_report_generated: explorationReport !== null,
+    // V1.0: Review Agent fields
+    review_verdict: reviewVerdict?.verdict ?? null,
+    review_confidence: reviewVerdict?.confidence ?? null,
+    review_issues_count: reviewVerdict?.issues?.length ?? 0,
+    review_iterations: reviewIteration,
+    review_summary: reviewVerdict?.summary ?? null,
+    require_human_review: REQUIRE_HUMAN_REVIEW,
+    pr_is_draft: SKIP_PR
+      ? null
+      : REQUIRE_HUMAN_REVIEW ||
+        (reviewVerdict !== null && !shouldAutoApprove(reviewVerdict)),
   };
 
   writeStepResult(stepResult);
@@ -1195,12 +1412,16 @@ async function main(): Promise<void> {
   log("ENGINE", "=".repeat(50));
   log("ENGINE", `Task complete.`);
   log("ENGINE", `  Explore agent  : google/gemini-3.1-flash-lite-preview`);
-  log("ENGINE", `  Plan agent     : google/gemini-3.1-pro-preview`);
+  log("ENGINE", `  Plan agent     : google/gemini-3.1-flash-preview`);
   log("ENGINE", `  Build agent    : google/gemini-3.1-pro-preview`);
+  log("ENGINE", `  Review agent   : google/gemini-3.1-pro-preview`);
   log("ENGINE", `  Subtasks       : ${plan.subtasks.length}`);
   log("ENGINE", `  Iterations     : ${totalIterations}`);
   log("ENGINE", `  Verification   : ${allPassed ? "PASSED" : "FAILED/SKIPPED"}`);
   log("ENGINE", `  Debug mode     : ${debugMode ? "ACTIVATED" : "No"}`);
+  log("ENGINE", `  Review verdict : ${reviewVerdict?.verdict ?? "skipped"} (confidence: ${reviewVerdict?.confidence?.toFixed(2) ?? "N/A"})`);
+  log("ENGINE", `  Review iters   : ${reviewIteration}`);
+  log("ENGINE", `  Human review   : ${REQUIRE_HUMAN_REVIEW ? "REQUIRED" : "auto"}`);
   log("ENGINE", `  Total cost     : $${costTracker.totalCost.toFixed(4)}`);
   log("ENGINE", `  Tokens in/out  : ${costTracker.totalTokensIn}/${costTracker.totalTokensOut} (${costTracker.totalCacheRead} cached)`);
   log("ENGINE", `  PR URL         : ${prUrl ?? "(none)"}`);
